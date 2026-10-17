@@ -1,0 +1,628 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0F1420">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="format-detection" content="telephone=no">
+<title>凹咕快讯 · 图片生成</title>
+<style>
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{margin:0;padding:0}
+  body{padding:10px 10px calc(10px + env(safe-area-inset-bottom));background:#f4f4f2;color:#222;
+       font:15px/1.6 "MiSans","Microsoft YaHei",system-ui,-apple-system,sans-serif;
+       -webkit-text-size-adjust:100%;}
+  .wrap{display:flex;flex-direction:column;gap:12px}
+  .stage{order:1;position:sticky;top:0;z-index:9;background:#f4f4f2;
+         padding:4px 0 8px;display:flex;justify-content:center}
+  .panel{order:2;background:#fff;border:1px solid #e4e4e1;border-radius:12px;padding:14px}
+  .panel h1{margin:0 0 12px;font-size:16px;font-weight:700;color:#1A1A1A}
+  label{display:block;margin:0 0 6px;font-size:13px;color:#555}
+  input,textarea{width:100%;padding:10px 12px;border:1px solid #dcdcd8;border-radius:8px;
+       font:16px/1.7 "MiSans","Microsoft YaHei",sans-serif;background:#fcfcfb;outline:none;
+       -webkit-appearance:none;appearance:none;}
+  input:focus,textarea:focus{border-color:#1A1A1A;background:#fff}
+  textarea{height:150px;resize:vertical;min-height:110px}
+  .row{display:flex;gap:10px}
+  .row>div{flex:1;min-width:0}
+  .field{margin-bottom:12px}
+  .btns{display:flex;gap:10px;margin-top:6px}
+  .seg{display:flex;gap:8px}
+  .seg button{flex:1;padding:12px 6px;border:1px solid #dcdcd8;border-radius:8px;cursor:pointer;
+       background:#fcfcfb;color:#555;font:600 13px/1.2 "MiSans","Microsoft YaHei",sans-serif}
+  .seg button.on{background:#1A1A1A;color:#fff;border-color:#1A1A1A}
+  button{flex:1;padding:13px 10px;border:0;border-radius:8px;cursor:pointer;
+         font:600 15px/1 "MiSans","Microsoft YaHei",sans-serif;min-height:46px}
+  #save{background:#1A1A1A;color:#fff}
+  #save:active{background:#000}
+  #demo{background:#f0f0ee;color:#444}
+  #demo:active{background:#e7e7e4}
+  button:disabled{opacity:.6}
+  .tip{margin-top:12px;padding:10px 12px;background:#f7f7f6;border:1px solid #e6e6e3;
+       border-radius:8px;font-size:12.5px;color:#666;line-height:1.75}
+  .tip b{color:#333}
+  .panel[data-mode="1"] #fUser{display:none}
+  .panel[data-mode="2"] #fTitle{display:none}
+  canvas{display:block;width:auto;height:auto;max-width:100%;max-height:46vh;
+         border-radius:8px;box-shadow:0 4px 18px rgba(0,0,0,.10);background:#0F1420}
+  .sheet{position:fixed;inset:0;z-index:99;background:rgba(12,14,20,.82);
+         display:flex;flex-direction:column;align-items:center;justify-content:center;
+         gap:14px;padding:16px calc(16px + env(safe-area-inset-right)) calc(16px + env(safe-area-inset-bottom));
+         overflow:auto;-webkit-overflow-scrolling:touch;}
+  .sheet[hidden]{display:none}
+  .sheet img{max-width:92vw;max-height:64vh;width:auto;height:auto;border-radius:8px;
+             box-shadow:0 8px 40px rgba(0,0,0,.5);background:#0F1420}
+  .sheet .hint{color:#E8ECF8;font-size:13.5px;text-align:center;line-height:1.7;max-width:32em}
+  .sheet .hint small{color:#8B98A5;font-size:12px}
+  .sheet .bar{display:flex;gap:10px;width:100%;max-width:420px}
+  .sheet .bar button,.sheet .bar a{flex:1;display:flex;align-items:center;justify-content:center;
+       padding:13px 10px;border-radius:8px;border:0;text-decoration:none;cursor:pointer;
+       font:600 15px/1 "MiSans","Microsoft YaHei",sans-serif}
+  .sheet .bar a{background:#E8ECF8;color:#0F1420}
+  .sheet .bar button{background:rgba(255,255,255,.14);color:#E8ECF8}
+  @media (min-width:920px){
+    body{padding:18px}
+    .wrap{flex-direction:row;align-items:flex-start;gap:18px}
+    .panel{order:1;flex:0 0 430px}
+    .stage{order:2;flex:1;position:static;justify-content:center}
+    canvas{max-height:none;max-width:600px}
+    textarea{height:220px}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="stage">
+    <canvas id="cv" width="1150" height="1550"></canvas>
+  </div>
+
+  <div class="panel" id="panel" data-mode="1">
+    <h1>凹咕快讯 · 图片生成</h1>
+    <div class="field">
+      <label>样式</label>
+      <div class="seg" id="seg">
+        <button type="button" data-mode="1" class="on">样式一 · 标题</button>
+        <button type="button" data-mode="2">样式二 · X 动态</button>
+      </div>
+    </div>
+    <div class="field" id="fTitle">
+      <label>标题</label>
+      <input id="title" placeholder="请输入标题">
+    </div>
+    <div class="field" id="fUser">
+      <label>用户名</label>
+      <input id="user" placeholder="例如：凹咕">
+    </div>
+    <div class="field">
+      <label>正文（空行分段）</label>
+      <textarea id="content" placeholder="请输入正文"></textarea>
+    </div>
+    <div class="row">
+      <div class="field">
+        <label>时间</label>
+        <input id="date" placeholder="留空 = 系统时间">
+      </div>
+      <div class="field">
+        <label>来源</label>
+        <input id="source" placeholder="GitHub">
+      </div>
+    </div>
+    <div class="btns">
+      <button id="save">保存 PNG</button>
+      <button id="demo">填入示例</button>
+    </div>
+    <div class="tip">
+      <b>手机上保存</b>：点「保存 PNG」后，系统会先调用分享面板（可直接「存储图像 / 保存到相册」）；
+      若不支持，则会弹出图片，<b>长按图片 → 存储到照片 / 保存图片</b> 即可。<br>
+      <b>样式一</b>：卡片顶部显示标题（自动加【】）。<b>样式二</b>：顶部改为 X logo + 动态 · 用户名。<br>
+      正文用 <b>**关键词**</b> 标记下划线强调；时间留空即取手机当前时间。<br>
+      输出固定为 2300×3100 PNG（版面 1150×1550 的 2 倍）。
+    </div>
+  </div>
+</div>
+
+<div class="sheet" id="outcome" hidden>
+  <img id="outImg" alt="生成的快讯图片">
+  <div class="hint" id="outHint">长按上方图片 → 「存储到照片 / 保存图片」</div>
+  <div class="bar">
+    <a id="outLink" download>下载 / 保存</a>
+    <button type="button" id="outClose">关闭</button>
+  </div>
+</div>
+
+<script>
+const W = 1150, H = 1550;
+
+const C = {
+  bg: '#0F1420',
+  card: { x:50, y:238, w:1050, h:1271.5, r:12, fill:'#1A2336', line:'#2F3336' },
+  logo:  { x:376, y:52, s:93, r:22, fill:'#E8ECF8', ch:'凹', size:56, stroke:2.2, glyph:'#0F1420' },
+  brand: { left:489, cy:101, size:76, ls:-4, stroke:3, black:'#E8ECF8', gray:'#E8ECF8',
+           name:'凹咕快讯', splitAt:2, name2:'开源情报' },
+  sub:   { cy:183, size:30, ls:22.3, color:'#8B98A5', text:'获取最新AI资讯',
+           text2:'获取热门开源作品' },
+  title: { firstBaseline:350, size:55, ls:-4, stroke:3, lh:73.5, maxW:800,
+           color:'#E8ECF8', maxLines:4 },
+  body:  { x:117, w:915, size:42, ls:-1, lh:58.5, gap:12.5,
+           color:'#E8ECF8', ulOffset:5.5, ulThick:3 },
+  date:  { size:32, bold:true, color:'#C3CCDE', ls:0, gapTitle:60, gapBody:70,
+           gapRule:34, gapAbove:50 },
+  foot:  { ruleY:1433, ruleH:2, ruleColor:'#2F3336', cy:1467, size:24,
+           color:'#8B98A5', brandColor:'#E8ECF8', brandLs:1.2, brand:'AOGU NEWS',
+           gapBelowTitle:20.5, bottomLimit:1413 },
+  x:     { boxX:117, boxY:278, padX:24, padY:18, boxR:14,
+           boxFill:'#161E2E', boxLine:'#2F3336', boxLw:1.5,
+           logoSize:52, iconColor:'#E8ECF8', gap:20, color:'#E8ECF8', label:'动态',
+           bodyFirstBaseline:440 }
+};
+
+const FONT = '"MiSans","Microsoft YaHei",sans-serif';
+const F_SERIF = 'Georgia,"Times New Roman",serif';
+const X_LOGO_PATH = 'M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 '
+                  + '21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 '
+                  + '17.52h1.833L7.084 4.126H5.117z';
+
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+
+const SCALE_PREVIEW = 1, SCALE_EXPORT = 2;
+let curScale = SCALE_PREVIEW;
+cv.width = W * curScale; cv.height = H * curScale;
+
+function ensureScale(s){
+  if (curScale === s && cv.width === W * s) return;
+  curScale = s;
+  cv.width = W * s;
+  cv.height = H * s;
+}
+
+function unitize(str){
+  const units = [];
+  let buf = '';
+  for (const ch of str){
+    if (/[A-Za-z0-9@#$%&+\-_.:'"\u2019]/.test(ch)) buf += ch;
+    else {
+      if (buf){ units.push(buf); buf = ''; }
+      units.push(ch);
+    }
+  }
+  if (buf) units.push(buf);
+  return units;
+}
+
+function setFont(size, serif){
+  if ('letterSpacing' in ctx) ctx.letterSpacing = '0px';
+  ctx.font = size + 'px ' + (serif ? F_SERIF : FONT);
+}
+
+function measure(str, size, serif){
+  setFont(size, serif);
+  return ctx.measureText(str).width;
+}
+
+function baselineForCY(sample, size, cy, serif){
+  setFont(size, serif);
+  const m = ctx.measureText(sample);
+  const asc = m.actualBoundingBoxAscent || size * 0.88;
+  const desc = m.actualBoundingBoxDescent || size * 0.12;
+  return cy + (asc - desc) / 2;
+}
+
+function toUnits(units, size, serif){
+  return units.map(u => typeof u === 'string'
+      ? { t:u, w:measure(u, size, serif), ul:false }
+      : { t:u.t, w:measure(u.t, size, serif), ul:!!u.ul });
+}
+
+function wrap(units, maxW, size, ls, serif){
+  const lines = [];
+  let line = [], w = 0;
+  for (const u of toUnits(units, size, serif)){
+    const add = u.w + (line.length ? ls : 0);
+    const blank = /^\s+$/.test(u.t);
+    if (line.length && w + add > maxW && !blank){
+      lines.push(line);
+      line = [u]; w = u.w;
+    } else if (blank && !line.length){
+      continue;
+    } else {
+      line.push(u); w += add;
+    }
+  }
+  if (line.length) lines.push(line);
+  return lines;
+}
+
+function lineWidth(line, ls){ return line.reduce((s,u)=>s+u.w, 0) + ls * (line.length - 1); }
+
+function drawLine(line, x, baseline, ls, opts){
+  const { fill, stroke, justify, maxW, size, serif } = opts;
+  setFont(size, serif);
+  let cx = x, gap = ls;
+  const natural = lineWidth(line, ls);
+  if (justify && line.length > 1 && maxW > natural) gap = ls + (maxW - natural) / (line.length - 1);
+  const drawn = [];
+  for (const u of line){
+    ctx.fillStyle = fill;
+    if (stroke){ ctx.lineWidth = stroke; ctx.strokeStyle = fill; ctx.strokeText(u.t, cx, baseline); }
+    ctx.fillText(u.t, cx, baseline);
+    drawn.push({ ...u, x:cx });
+    cx += u.w + gap;
+  }
+  return drawn;
+}
+
+function parseEmphasis(text){
+  const parts = text.split(/\*\*(.+?)\*\*/g);
+  const segs = [];
+  for (let i = 0; i < parts.length; i++){
+    if (!parts[i]) continue;
+    segs.push({ text: parts[i], ul: i % 2 === 1, marker: i % 2 === 0 });
+  }
+  const units = [];
+  for (const s of segs) for (const u of unitize(s.text)) units.push({ t:u, ul:s.ul });
+  return units;
+}
+
+function formatDate(input){
+  const p2 = n => String(n).padStart(2, '0');
+  const now = new Date();
+  const s = (input || '').trim();
+  if (!s) return `${now.getFullYear()}-${p2(now.getMonth() + 1)}-${p2(now.getDate())}`
+               + ` · ${p2(now.getHours())}:${p2(now.getMinutes())}`;
+  const m = s.match(/^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})(?:\s*[T·]?\s*(\d{1,2}):(\d{2}))?/);
+  if (!m) return s;
+  let hh, mi;
+  if (m[4] !== undefined){ hh = p2(+m[4]); mi = m[5]; }
+  else { hh = p2(now.getHours()); mi = p2(now.getMinutes()); }
+  return `${m[1]}-${p2(+m[2])}-${p2(+m[3])} · ${hh}:${mi}`;
+}
+
+function roundRect(x, y, w, h, r){
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function drawBackground(){
+  ctx.fillStyle = C.bg;
+  ctx.fillRect(0, 0, W, H);
+  const { x, y, w, h, r, fill, line } = C.card;
+  ctx.save();
+  ctx.fillStyle = fill; roundRect(x, y, w, h, r); ctx.fill();
+  ctx.strokeStyle = line; ctx.lineWidth = 1.5; roundRect(x, y, w, h, r); ctx.stroke();
+  ctx.restore();
+}
+
+function drawHeader(style2){
+  const L = C.logo;
+  ctx.fillStyle = L.fill;
+  roundRect(L.x, L.y, L.s, L.s, L.r); ctx.fill();
+
+  ctx.save();
+  ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+  const b1 = baselineForCY(L.ch, L.size, L.y + L.s / 2, false);
+  setFont(L.size, false);
+  const w1 = ctx.measureText(L.ch).width;
+  ctx.fillStyle = L.glyph;
+  ctx.lineWidth = L.stroke; ctx.strokeStyle = L.glyph;
+  const lx = L.x + (L.s - w1) / 2;
+  ctx.strokeText(L.ch, lx, b1); ctx.fillText(L.ch, lx, b1);
+  ctx.restore();
+
+  const B = C.brand;
+  const bText = (style2 && B.name2) ? B.name2 : B.name;
+  const black = bText.slice(0, B.splitAt), rest = bText.slice(B.splitAt);
+  ctx.textAlign = 'left';
+  drawLine(toUnits(unitize(black), B.size), B.left, baselineForCY('凹', B.size, B.cy), B.ls,
+           { fill:B.black, stroke:B.stroke, size:B.size });
+  const bx = B.left + (measure(black, B.size) + B.ls * black.length);
+  drawLine(toUnits(unitize(rest), B.size), bx, baselineForCY('凹', B.size, B.cy), B.ls,
+           { fill:B.gray, stroke:B.stroke, size:B.size });
+
+  const S = C.sub;
+  const sText = (style2 && S.text2) ? S.text2 : S.text;
+  const su = unitize(sText);
+  const sw = su.reduce((s,u)=>s+measure(u, S.size),0) + S.ls * (su.length - 1);
+  let sx = (W - sw) / 2;
+  const sBase = baselineForCY('获', S.size, S.cy);
+  ctx.fillStyle = S.color;
+  setFont(S.size, false);
+  for (const u of su){
+    ctx.fillText(u, sx, sBase);
+    sx += measure(u, S.size) + S.ls;
+  }
+}
+
+function drawXLogo(x, y, size, color){
+  const s = size / 24;
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.scale(s, s);
+  ctx.fillStyle = color;
+  ctx.fill(new Path2D(X_LOGO_PATH));
+  ctx.restore();
+}
+
+function drawXHeader(user, textSize){
+  const X = C.x;
+  const name = (user || '').trim();
+  const parts = name
+      ? [{ t:X.label, bold:false }, { t:' · ', bold:false }, { t:name, bold:true }]
+      : [{ t:X.label, bold:false }];
+  const widths = parts.map(p => {
+    if ('letterSpacing' in ctx) ctx.letterSpacing = '0px';
+    ctx.font = (p.bold ? '700 ' : '') + textSize + 'px ' + FONT;
+    return ctx.measureText(p.t).width;
+  });
+  const textW = widths.reduce((a, b) => a + b, 0);
+
+  const boxH = X.logoSize + X.padY * 2;
+  const boxW = X.padX * 2 + X.logoSize + X.gap + textW;
+  const cy = X.boxY + boxH / 2;
+  ctx.save();
+  ctx.fillStyle = X.boxFill;
+  roundRect(X.boxX, X.boxY, boxW, boxH, X.boxR); ctx.fill();
+  ctx.strokeStyle = X.boxLine; ctx.lineWidth = X.boxLw;
+  roundRect(X.boxX, X.boxY, boxW, boxH, X.boxR);
+  ctx.stroke();
+  ctx.restore();
+
+  drawXLogo(X.boxX + X.padX, X.boxY + X.padY, X.logoSize, X.iconColor);
+
+  const base = baselineForCY('动', textSize, cy);
+  let cx = X.boxX + X.padX + X.logoSize + X.gap;
+  parts.forEach((p, i) => {
+    if ('letterSpacing' in ctx) ctx.letterSpacing = '0px';
+    ctx.font = (p.bold ? '700 ' : '') + textSize + 'px ' + FONT;
+    ctx.fillStyle = X.color;
+    ctx.fillText(p.t, cx, base);
+    cx += widths[i];
+  });
+}
+
+function render(data){
+  const T = C.title, BO = C.body, FO = C.foot, XH = C.x;
+  const style2 = data.mode === 2;
+  ctx.setTransform(curScale, 0, 0, curScale, 0, 0);
+  ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+
+  const titleText = (!style2 && data.title)
+      ? (data.title.startsWith('【') ? data.title : '【' + data.title + '】') : '';
+  let tSize = T.size, tLines = [];
+  if (titleText){
+    const tu = unitize(titleText);
+    for (; tSize >= 26; tSize -= 1){
+      tLines = wrap(tu, T.maxW, tSize, T.ls);
+      if (tLines.length <= T.maxLines) break;
+    }
+  }
+  const tScale = titleText ? tSize / T.size : 1;
+  const tPitch = T.lh * tScale;
+  const lastTitleBaseline = tLines.length
+      ? T.firstBaseline + (tLines.length - 1) * tPitch
+      : T.firstBaseline - tPitch;
+
+  const DT = C.date;
+  const dateText = data.dateText || '';
+  const dateBaseline = style2 ? FO.ruleY - DT.gapRule : lastTitleBaseline + DT.gapTitle;
+  const bodyFirstBaseline = style2
+      ? XH.bodyFirstBaseline
+      : (dateText ? dateBaseline + DT.gapBody
+                  : lastTitleBaseline + tPitch + FO.gapBelowTitle);
+  const paras = (data.content || '').split(/\n\s*\n|\n/).map(s => s.trim()).filter(Boolean);
+  const available = (style2 && dateText ? dateBaseline - DT.gapAbove : FO.bottomLimit)
+                  - bodyFirstBaseline;
+
+  let bSize = BO.size, bData = null;
+  if (paras.length){
+    for (; bSize >= 18; bSize -= 1){
+      const lh = BO.lh * (bSize / BO.size);
+      const ls = BO.ls * (bSize / BO.size);
+      const gap = BO.gap * (bSize / BO.size);
+      const blocks = paras.map(p => wrap(parseEmphasis(p), BO.w, bSize, ls));
+      const totalLines = blocks.reduce((s, b) => s + b.length, 0);
+      const need = (totalLines - 1) * lh + (blocks.length - 1) * gap + bSize * 0.26;
+      if (need <= available || bSize === 18){ bData = { blocks, lh, ls, gap, size:bSize }; break; }
+    }
+  }
+
+  drawBackground();
+  drawHeader(style2);
+
+  if (style2) drawXHeader(data.user, bData ? bData.size : BO.size);
+
+  if (tLines.length){
+    ctx.fillStyle = T.color; ctx.strokeStyle = T.color;
+    for (let i = 0; i < tLines.length; i++){
+      const line = tLines[i];
+      const w = lineWidth(line, T.ls);
+      drawLine(line, (W - w) / 2, T.firstBaseline + i * tPitch, T.ls,
+               { fill:T.color, stroke:T.stroke * tScale, size:tSize });
+    }
+  }
+
+  if (dateText){
+    if ('letterSpacing' in ctx) ctx.letterSpacing = DT.ls + 'px';
+    ctx.font = (DT.bold ? '700 ' : '') + DT.size + 'px ' + FONT;
+    ctx.fillStyle = DT.color;
+    ctx.fillText(dateText, BO.x + BO.w - ctx.measureText(dateText).width, dateBaseline);
+    if ('letterSpacing' in ctx) ctx.letterSpacing = '0px';
+  }
+
+  if (bData){
+    let base = bodyFirstBaseline;
+    bData.blocks.forEach((block, pi) => {
+      if (pi) base += bData.gap;
+      block.forEach((line, li) => {
+        const last = li === block.length - 1;
+        const drawn = drawLine(line, BO.x, base, bData.ls,
+                    { fill:BO.color, justify:!last, maxW:BO.w, size:bData.size });
+        ctx.fillStyle = BO.color;
+        ctx.beginPath();
+        let runStart = null, runEnd = null;
+        const flush = () => {
+          if (runStart !== null){
+            const y = base + BO.ulOffset;
+            ctx.fillRect(runStart, y, runEnd - runStart, BO.ulThick);
+            runStart = null;
+          }
+        };
+        for (const u of drawn){
+          if (u.ul){
+            const x0 = u.x, x1 = u.x + u.w;
+            if (runStart === null) runStart = x0;
+            runEnd = Math.max(runEnd === null ? x1 : runEnd, x1);
+          } else flush();
+        }
+        flush();
+        base += bData.lh;
+      });
+    });
+  }
+
+  ctx.fillStyle = FO.ruleColor;
+  ctx.fillRect(BO.x, FO.ruleY, BO.w, FO.ruleH);
+  const fb = baselineForCY('来', FO.size, FO.cy);
+  setFont(FO.size, false);
+  ctx.fillStyle = FO.color;
+  ctx.fillText('来源 / ' + (data.source || ''), BO.x, fb);
+
+  if ('letterSpacing' in ctx) ctx.letterSpacing = '0px';
+  ctx.font = '700 ' + FO.size + 'px ' + FONT;
+  const bChars = [...FO.brand];
+  const bWidths = bChars.map(ch => ctx.measureText(ch).width);
+  const bTotal = bWidths.reduce((a, b) => a + b, 0) + FO.brandLs * (bChars.length - 1);
+  let bx = BO.x + BO.w - bTotal;
+  ctx.fillStyle = FO.brandColor;
+  bChars.forEach((ch, i) => {
+    ctx.font = '700 ' + FO.size + 'px ' + FONT;
+    ctx.fillText(ch, bx, fb);
+    bx += bWidths[i] + FO.brandLs;
+  });
+}
+
+let mode = 1;
+
+function readForm(){
+  return {
+    mode: mode,
+    title: document.getElementById('title').value.trim(),
+    user: document.getElementById('user').value.trim(),
+    content: document.getElementById('content').value.replace(/\r/g, '').trim(),
+    dateText: formatDate(document.getElementById('date').value),
+    source: document.getElementById('source').value.trim()
+  };
+}
+
+let timer = null;
+function update(){
+  clearTimeout(timer);
+  timer = setTimeout(() => render(readForm()), 80);
+}
+
+['title','user','content','date','source'].forEach(id =>
+  document.getElementById(id).addEventListener('input', update));
+
+setInterval(() => {
+  if (!document.getElementById('date').value.trim()) update();
+}, 30000);
+
+document.getElementById('seg').addEventListener('click', e => {
+  const b = e.target.closest('button[data-mode]');
+  if (!b) return;
+  mode = +b.dataset.mode;
+  document.getElementById('panel').dataset.mode = mode;
+  document.querySelectorAll('#seg button').forEach(x => x.classList.toggle('on', x === b));
+  update();
+});
+
+function fileName(d){
+  const name = (d.title ? d.title.slice(0, 20) : '凹咕快讯')
+      + (d.dateText ? '_' + d.dateText.split(' ')[0] : '') + '.png';
+  return name.replace(/[\\/:*?"<>|]/g, '');
+}
+
+async function exportPNG(){
+  const d = readForm();
+  ensureScale(SCALE_EXPORT);
+  render(d);
+  const blob = await new Promise(res => cv.toBlob(res, 'image/png'));
+  ensureScale(SCALE_PREVIEW);
+  render(d);
+  return { blob, name: fileName(d) };
+}
+
+const sheet = document.getElementById('outcome');
+const outImg = document.getElementById('outImg');
+const outLink = document.getElementById('outLink');
+const outHint = document.getElementById('outHint');
+let outURL = null;
+
+function showSheet(blob, name){
+  if (outURL) URL.revokeObjectURL(outURL);
+  outURL = URL.createObjectURL(blob);
+  outImg.src = outURL;
+  outLink.href = outURL;
+  outLink.download = name;
+  const isWeChat = /MicroMessenger/i.test(navigator.userAgent);
+  outHint.innerHTML = isWeChat
+    ? '长按上方图片 → <b>保存图片</b>'
+    : '长按上方图片 → <b>存储到照片</b>；或点下方按钮下载<br><small>' + name + '</small>';
+  sheet.hidden = false;
+}
+
+document.getElementById('outClose').addEventListener('click', () => {
+  sheet.hidden = true;
+  if (outURL){ URL.revokeObjectURL(outURL); outURL = null; outImg.removeAttribute('src'); }
+});
+
+document.getElementById('save').addEventListener('click', async e => {
+  const btn = e.currentTarget;
+  const old = btn.textContent;
+  btn.disabled = true; btn.textContent = '生成中…';
+  try {
+    const { blob, name } = await exportPNG();
+    if (!blob) throw new Error('图片生成失败');
+    let shared = false;
+    try {
+      if (navigator.canShare && navigator.canShare({ files: [new File([blob], name, { type: 'image/png' })] })){
+        await navigator.share({ files: [new File([blob], name, { type: 'image/png' })], title: name });
+        shared = true;
+      }
+    } catch (err) {
+      if (err && err.name === 'AbortError') shared = true;
+    }
+    if (!shared) showSheet(blob, name);
+  } catch (err) {
+    alert('生成失败：' + (err && err.message ? err.message : err));
+  } finally {
+    btn.disabled = false; btn.textContent = old;
+  }
+});
+
+document.getElementById('demo').addEventListener('click', () => {
+  document.getElementById('title').value =
+    'GitHub用Copilot写下80万行核心代码：一个人，几个月干完团队一两年的活';
+  document.getElementById('content').value =
+    'GitHub 完成了一次罕见的大型软件迁移：借助 Copilot，将 Agent 核心运行时从 TypeScript 重写为超过 80 万行 Rust。GitHub 表示，**大部分代码由 AI Agent 编写**，整个项目主要由一名开发者推进。\n' +
+    '这套运行时是 Copilot 命令行、应用和代码审查等产品背后的共同底座。迁移被拆成 128 个合并请求，在约 14 周半内连续发布 135 个版本，一边替换，一边测试。\n' +
+    '最终形成的生产代码达到 83.2 万行，另有约 46.9 万行单元测试。过去需要一支团队花一到两年完成的迁移，如今**一个人借助 Agent，几个月就做完了**。';
+  document.getElementById('date').value = '';
+  document.getElementById('source').value = 'GitHub';
+  document.getElementById('user').value = '凹咕';
+  update();
+});
+
+if (document.fonts && document.fonts.ready) document.fonts.ready.then(update);
+else update();
+update();
+</script>
+</body>
+</html>
