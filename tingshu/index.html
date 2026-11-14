@@ -52,45 +52,53 @@
   </section>
 
   <section id="view-settings" class="view" hidden>
-    <div class="card">
-      <div class="card-title">MiMo 语音合成</div>
-      <label class="field">
-        <span>API Key</span>
-        <input id="apiKey" type="password" placeholder="在 platform.xiaomimimo.com 生成" autocomplete="off" spellcheck="false">
-      </label>
-      <label class="field">
-        <span>接口地址</span>
-        <input id="baseUrl" type="url" placeholder="https://api.xiaomimimo.com/v1" autocomplete="off" spellcheck="false">
-      </label>
-      <div class="row">
-        <button id="btnTest" class="btn">测试合成</button>
-        <button id="btnSaveSettings" class="btn primary">保存</button>
+    <div class="card collapsible">
+      <div class="card-title collapsible-head" role="button" tabindex="0" aria-expanded="false">
+        <span>MiMo 语音合成</span><span class="collapse-caret" aria-hidden="true">›</span>
       </div>
-      <p class="hint">Key 只存在这台设备的浏览器里，不会上传到任何服务器。</p>
-    </div>
-
-    <div class="card">
-      <div class="card-title">AI 角色解析 <span class="hint">可选</span></div>
-      <label class="field">
-        <span>DeepSeek API Key</span>
-        <input id="aiKey" type="password" placeholder="sk-..." autocomplete="off" spellcheck="false">
-      </label>
-      <details class="adv">
-        <summary>高级：更换接口 / 模型</summary>
+      <div class="collapsible-body">
+        <label class="field">
+          <span>API Key</span>
+          <input id="apiKey" type="password" placeholder="在 platform.xiaomimimo.com 生成" autocomplete="off" spellcheck="false">
+        </label>
         <label class="field">
           <span>接口地址</span>
-          <input id="aiBaseUrl" type="url" autocomplete="off" spellcheck="false">
+          <input id="baseUrl" type="url" placeholder="https://api.xiaomimimo.com/v1" autocomplete="off" spellcheck="false">
         </label>
-        <label class="field">
-          <span>模型</span>
-          <input id="aiModel" type="text" autocomplete="off" spellcheck="false">
-        </label>
-      </details>
-      <div class="row">
-        <button id="btnAiTest" class="btn">连接测试</button>
-        <button id="btnSaveAi" class="btn primary">保存</button>
+        <div class="row">
+          <button id="btnTest" class="btn">测试合成</button>
+          <button id="btnSaveSettings" class="btn primary">保存</button>
+        </div>
+        <p class="hint">Key 只存在这台设备的浏览器里，不会上传到任何服务器。</p>
       </div>
-      <p class="hint">默认使用 DeepSeek（deepseek-chat），只需填 Key；也支持其他 OpenAI 兼容接口。Key 只存本机，调用会产生你账号的费用。</p>
+    </div>
+
+    <div class="card collapsible">
+      <div class="card-title collapsible-head" role="button" tabindex="0" aria-expanded="false">
+        <span>AI 角色解析 <span class="hint">可选</span></span><span class="collapse-caret" aria-hidden="true">›</span>
+      </div>
+      <div class="collapsible-body">
+        <label class="field">
+          <span>DeepSeek API Key</span>
+          <input id="aiKey" type="password" placeholder="sk-..." autocomplete="off" spellcheck="false">
+        </label>
+        <details class="adv">
+          <summary>高级：更换接口 / 模型</summary>
+          <label class="field">
+            <span>接口地址</span>
+            <input id="aiBaseUrl" type="url" autocomplete="off" spellcheck="false">
+          </label>
+          <label class="field">
+            <span>模型</span>
+            <input id="aiModel" type="text" autocomplete="off" spellcheck="false">
+          </label>
+        </details>
+        <div class="row">
+          <button id="btnAiTest" class="btn">连接测试</button>
+          <button id="btnSaveAi" class="btn primary">保存</button>
+        </div>
+        <p class="hint">默认使用 DeepSeek（deepseek-chat），只需填 Key；也支持其他 OpenAI 兼容接口。Key 只存本机，调用会产生你账号的费用。</p>
+      </div>
     </div>
 
     <div class="card">

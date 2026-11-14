@@ -3,7 +3,7 @@
 const DEFAULT_BASE = 'https://api.xiaomimimo.com/v1';
 const AI_DEFAULT_BASE = 'https://api.deepseek.com/v1';
 const AI_DEFAULT_MODEL = 'deepseek-chat';
-const APP_VER = 'v28';
+const APP_VER = 'v29';
 const VOICES = [
   { id: '冰糖', label: '冰糖 · 中文女声' },
   { id: '茉莉', label: '茉莉 · 中文女声' },
@@ -3577,6 +3577,19 @@ function bind() {
     if (currentView !== 'player') showView('player');
     playIndex(i);
   });
+  document.querySelectorAll('.card.collapsible .collapsible-head').forEach((head) => {
+    const toggle = () => {
+      const card = head.closest('.card.collapsible');
+      const open = !card.classList.contains('open');
+      card.classList.toggle('open', open);
+      head.setAttribute('aria-expanded', open ? 'true' : 'false');
+    };
+    head.addEventListener('click', toggle);
+    head.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); }
+    });
+  });
+
   $('btnSaveSettings').addEventListener('click', () => {
     saveSettings({
       apiKey: $('apiKey').value.trim(),
@@ -3872,9 +3885,17 @@ function chatMsgEl(m, showName) {
   av.className = 'cavatar';
   if (m.role === 'user') av.textContent = '我';
   else {
-    av.textContent = String(m.speaker || '?').slice(0, 1);
-    av.style.background = chatSpeakerColor(m.speaker);
-    av.style.color = '#fff';
+    const entry = book?.cast?.[m.speaker];
+    if (entry?.avatar) {
+      av.classList.add('has-img');
+      av.style.backgroundImage = `url("${entry.avatar}")`;
+    } else {
+      av.textContent = String(m.speaker || '?').slice(0, 1);
+      av.style.background = chatSpeakerColor(m.speaker);
+      av.style.color = '#fff';
+    }
+    av.classList.add('clickable');
+    av.addEventListener('click', (e) => { e.stopPropagation(); openCharPage(m.speaker); });
   }
   const body = document.createElement('div');
   body.className = 'cmsg-body';
@@ -4209,6 +4230,10 @@ function chatMemberBrief(name) {
   if (e) {
     const tags = stageTags(null, e);
     if (tags) bits.push('语气:' + tags);
+    const chatStyle = String(e.chatStyle || '').trim();
+    if (chatStyle) bits.push('群聊语气:' + chatStyle.slice(0, 80));
+    const bio = String(e.chatBio || '').trim();
+    if (bio) bits.push('补充设定:' + bio.slice(0, 200));
   }
   return bits.join('｜');
 }
@@ -4224,6 +4249,7 @@ ${members}
 
 规则：
 - 只输出 1-${chat.replyMax} 条消息，像即时聊天一样短，每条 6-40 字，口语化，可以带（）里的动作。
+- 小说原著设定是底层事实：成员简介里的「群聊语气」「补充设定」只用于演绎细节，不能改写原著里的身份、经历和关系。
 - speaker 必须是成员名字之一，保持各角色的性格和说话习惯。
 - 可以自然接话、吐槽、互怼，但不要替用户说话，也不要写旁白。
 - 想发表情时，在 text 末尾只写方括号包住的表情名，如 [偷笑]；不要加“表情”二字，不要用【】。可用表情：${stickerNames}。表情名必须与列表完全一致，不要自造。
@@ -4502,6 +4528,125 @@ function closeChatModal() {
   $('chatModalBody').innerHTML = '';
   chatModalApplyFn = null;
   chatVoiceDraft = null;
+}
+
+function chatAvatarFromFile(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      const S = 160;
+      const c = document.createElement('canvas');
+      c.width = S;
+      c.height = S;
+      const g = c.getContext('2d');
+      const scale = Math.max(S / img.width, S / img.height);
+      const w = img.width * scale;
+      const h = img.height * scale;
+      g.drawImage(img, (S - w) / 2, (S - h) / 2, w, h);
+      URL.revokeObjectURL(url);
+      resolve(c.toDataURL('image/jpeg', 0.85));
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('图片读取失败')); };
+    img.src = url;
+  });
+}
+
+function openCharPage(name) {
+  if (!book || !name) return;
+  const entry = castEntryFor(name);
+  const d = (book.detected || []).find((x) => canonical(x.name) === canonical(name));
+  const g = entry.gender || '?';
+  const tone = String(d?.tone || '').trim();
+  const aliases = [...new Set((book.detected || []).filter((x) => canonical(x.name) === canonical(name) && x.name !== name).map((x) => x.name))];
+  const initial = escapeAttr(String(name).slice(0, 1));
+  let pendingAvatar = entry.avatar || '';
+  const paintAvatar = () => {
+    const av = $('charAvatar');
+    if (!av) return;
+    av.classList.toggle('has-img', !!pendingAvatar);
+    av.style.background = pendingAvatar ? '' : chatSpeakerColor(name);
+    av.style.backgroundImage = pendingAvatar ? `url("${pendingAvatar}")` : '';
+    av.innerHTML = pendingAvatar ? '' : `<span>${initial}</span>`;
+    $('charAvatarClear').hidden = !pendingAvatar;
+  };
+  openChatModal(`角色 · ${name}`, `
+    <div class="char-hero">
+      <div class="char-avatar" id="charAvatar"></div>
+      <div class="char-hero-main">
+        <div class="char-hero-name">${escapeAttr(name)}</div>
+        <div class="char-hero-sub">性别：${genderLabel(g)} · 小说设定</div>
+        ${aliases.length ? `<div class="char-hero-sub">别名：${aliases.map((a) => escapeAttr(a)).join('、')}</div>` : ''}
+      </div>
+    </div>
+    <div class="char-novel">
+      <div class="char-novel-title">原著设定（只读）</div>
+      <div>性别：${genderLabel(g)}${tone ? ` · 语气：${escapeAttr(tone)}` : ''}</div>
+      ${entry.voiceDesc ? `<div>音色描述：${escapeAttr(entry.voiceDesc)}</div>` : ''}
+      <div class="char-novel-note">朗读和剧情仍以小说原文为准，下面的设置只补充群聊里的演绎。</div>
+    </div>
+    <div class="char-avatar-row">
+      <button class="mini-btn" id="charAvatarPick">更换头像</button>
+      <button class="mini-btn" id="charAvatarClear">恢复默认</button>
+      <input type="file" id="charAvatarFile" accept="image/*" hidden>
+    </div>
+    <div class="chat-field"><span>音色（和角色音色卡同一个设置）</span>
+      <div class="char-voice-row">
+        <select id="charVoice">${voiceOptions(entry.voice)}</select>
+        <button class="mini-btn" id="charVoiceTry">试听</button>
+      </div>
+    </div>
+    <div class="chat-field"><span>群聊语气（只影响群聊）</span>
+      <textarea id="charStyle" rows="2" placeholder="比如：更毒舌、爱用短句、习惯反问">${escapeAttr(entry.chatStyle || '')}</textarea>
+    </div>
+    <div class="chat-field"><span>补充设定</span>
+      <textarea id="charBio" rows="3" placeholder="近况、爱好、对表情包的使用频率，比如：最近在学做饼干；几乎每句都配表情包">${escapeAttr(entry.chatBio || '')}</textarea>
+    </div>
+    <p class="hint">补充设定只作演绎参考；原著里的身份、经历、关系优先，不会被覆盖。</p>
+  `, '保存', async () => {
+    const e2 = castEntryFor(name);
+    e2.manual = true;
+    const v = $('charVoice').value;
+    e2.voice = v;
+    if (e2.stages) for (const st of e2.stages) st.voice = v;
+    e2.chatStyle = $('charStyle').value.trim();
+    e2.chatBio = $('charBio').value.trim();
+    if (pendingAvatar) e2.avatar = pendingAvatar; else delete e2.avatar;
+    saveBookSoon();
+    clearUrlCache();
+    if (chat) renderChatMessages();
+    renderCast();
+    closeChatModal();
+    toast('角色已更新');
+  });
+  paintAvatar();
+  const file = $('charAvatarFile');
+  $('charAvatarPick').addEventListener('click', () => file.click());
+  $('charAvatarClear').addEventListener('click', () => {
+    pendingAvatar = '';
+    paintAvatar();
+  });
+  file.addEventListener('change', async () => {
+    const f = file.files && file.files[0];
+    if (!f) return;
+    try {
+      pendingAvatar = await chatAvatarFromFile(f);
+      paintAvatar();
+    } catch {
+      toast('图片读取失败');
+    }
+    file.value = '';
+  });
+  $('charVoiceTry').addEventListener('click', async () => {
+    const e2 = book.cast[name] || {};
+    const selVoice = $('charVoice').value;
+    let cloneUri = '';
+    if (e2.clone) {
+      const cs = await getCloneSample(book.id, e2.cloneOwner || name);
+      if (cs?.dataUri) cloneUri = cs.dataUri;
+    }
+    previewVoice(`你好，我是${name}。`, selVoice, entryTags(e2), speechCard(e2, null), cloneUri);
+  });
 }
 
 function openCreateGroup() {
