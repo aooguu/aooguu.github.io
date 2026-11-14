@@ -3,7 +3,7 @@
 const DEFAULT_BASE = 'https://api.xiaomimimo.com/v1';
 const AI_DEFAULT_BASE = 'https://api.deepseek.com/v1';
 const AI_DEFAULT_MODEL = 'deepseek-chat';
-const APP_VER = 'v9';
+const APP_VER = 'v10';
 const VOICES = [
   { id: '冰糖', label: '冰糖 · 中文女声' },
   { id: '茉莉', label: '茉莉 · 中文女声' },
@@ -887,6 +887,11 @@ function castEntryFor(name) {
   book.cast = book.cast || {};
   let e = book.cast[name];
   if (e) return e;
+  if (name === '旁白') {
+    e = { voice: '冰糖', style: NARRATOR_STYLE, gender: '?' };
+    book.cast[name] = e;
+    return e;
+  }
   const list = book.detected || [];
   const d = list.find((x) => x.name === name) || list.find((x) => canonical(x.name) === name);
   const g = d?.gender || '?';
@@ -1569,6 +1574,7 @@ function renderCast() {
         <input class="cast-style" placeholder="语气指令（可留空）" value="${escapeAttr(narrator.style || '')}">
         <button class="mini-btn cast-preview">试听</button>
       </div>
+      ${fp ? '' : `<input class="cast-desc cast-desc-main" placeholder="音色描述（含年龄），如：三十岁女性，声音清亮，语速适中" value="${escapeAttr(narrator.voiceDesc || '')}">`}
       <input class="cast-tags cast-tags-main" placeholder="风格标签，如：平稳 语速适中" value="${escapeAttr(entryTags(narrator))}">
     </div>
     ${rows.map(([name, info]) => {
@@ -1582,6 +1588,7 @@ function renderCast() {
               <span class="stage-range">${aiRangeLabel(st)}</span>
               ${st.label ? `<span class="ai-badge">${escapeAttr(st.label)}</span>` : ''}
             </div>
+            <input class="cast-desc stage-desc" placeholder="该阶段音色描述（含年龄），如：六十岁男性，声音苍老沙哑" value="${escapeAttr(st.desc || '')}">
             <input class="cast-tags stage-tags" placeholder="风格标签，如：苍老 沙哑 语速缓慢" title="${escapeAttr(st.desc || '')}" value="${escapeAttr(stageTags(st, e))}">
             <div class="row">
               <button class="mini-btn stage-preview">试听该阶段</button>
@@ -1599,33 +1606,41 @@ function renderCast() {
           <input class="cast-style" placeholder="语气指令（可留空）" value="${escapeAttr(e.style || '')}">
           <button class="mini-btn cast-preview">试听</button>
         </div>
+        ${staged ? '' : `<input class="cast-desc cast-desc-main" placeholder="音色描述（含年龄），如：四十岁男性，声音低沉沙哑，语速缓慢" value="${escapeAttr(e.voiceDesc || '')}">`}
         ${staged ? '' : `<input class="cast-tags cast-tags-main" placeholder="风格标签，如：磁性 低沉 语速缓慢" title="${escapeAttr(e.voiceDesc || '')}" value="${escapeAttr(entryTags(e))}">`}
         ${stageHtml}
       </div>`;
     }).join('')}
-        <p class="cast-note">${fp ? `第一人称：旁白和对白里的“我”都按主角「${escapeAttr(book.protagonist)}」处理。` : ''}性别和语气由全书统计推断，可点 ? 修改；改名字会把同名的话合并。AI 解析按批推进（每批约 ${(AI_WINDOW_CHARS / 10000).toFixed(0)} 万字），会按章记录角色的年龄阶段；同一时期只保留一套标签，不会因为描述措辞不同反复换声。听到离本批结尾约 ${(AI_NUDGE_CHARS / 10000).toFixed(0)} 万字时会提醒继续解析。<br>播放时用基础模型实时合成，标签直接控制音色和语气，不再生成或复刻样本：标签留空会按音色描述自动推导；短词如「沙哑」「苍老」「语速缓慢」比长句更稳定，最多 6 个，用空格分隔。</p>`;
+        <p class="cast-note">${fp ? `第一人称：旁白和对白里的“我”都按主角「${escapeAttr(book.protagonist)}」处理。` : ''}性别和语气由全书统计推断，可点 ? 修改；改名字会把同名的话合并。AI 解析按批推进（每批约 ${(AI_WINDOW_CHARS / 10000).toFixed(0)} 万字），会按章记录角色的年龄阶段；同一时期只保留一套标签，不会因为描述措辞不同反复换声。听到离本批结尾约 ${(AI_NUDGE_CHARS / 10000).toFixed(0)} 万字时会提醒继续解析。<br>「音色描述」会原样作为角色卡片发给模型，年龄写在这里最稳；改动后该角色的音频会重新合成。播放时用基础模型实时合成，标签直接控制音色和语气，不再生成或复刻样本：标签留空会按音色描述自动推导；短词如「沙哑」「苍老」「语速缓慢」比长句更稳定，最多 6 个，用空格分隔。</p>`;
 
   panel.querySelectorAll('.cast-row').forEach(row => {
     const name = row.dataset.name;
     row.querySelector('.cast-voice').addEventListener('change', (e) => {
-      book.cast[name] = book.cast[name] || { voice: '苏打', style: '' };
+      const entry = castEntryFor(name);
       const v = e.target.value;
-      book.cast[name].voice = v;
-      if (book.cast[name].stages) for (const st of book.cast[name].stages) st.voice = v;
+      entry.voice = v;
+      if (entry.stages) for (const st of entry.stages) st.voice = v;
       saveBookSoon();
       clearUrlCache();
     });
     row.querySelector('.cast-style').addEventListener('input', (e) => {
-      book.cast[name] = book.cast[name] || { voice: '苏打', style: '' };
-      book.cast[name].style = e.target.value.trim();
-      if (book.cast[name].stages) for (const st of book.cast[name].stages) st.style = book.cast[name].style;
+      const entry = castEntryFor(name);
+      entry.style = e.target.value.trim();
+      if (entry.stages) for (const st of entry.stages) st.style = entry.style;
       saveBookSoon();
     });
+    const descInput = row.querySelector('.cast-desc-main');
+    if (descInput) {
+      descInput.addEventListener('input', (e) => {
+        castEntryFor(name).voiceDesc = e.target.value.trim();
+        saveBookSoon();
+      });
+      descInput.addEventListener('change', () => clearUrlCache());
+    }
     const tagsInput = row.querySelector('.cast-tags-main');
     if (tagsInput) {
       tagsInput.addEventListener('input', (e) => {
-        book.cast[name] = book.cast[name] || { voice: '苏打', style: '' };
-        book.cast[name].tags = e.target.value.trim();
+        castEntryFor(name).tags = e.target.value.trim();
         saveBookSoon();
       });
       tagsInput.addEventListener('change', () => clearUrlCache());
@@ -1655,6 +1670,13 @@ function renderCast() {
       const si = +sr.dataset.si;
       const st = book.cast[name]?.stages?.[si];
       if (!st) return;
+      const stDesc = sr.querySelector('.stage-desc');
+      stDesc.addEventListener('input', (ev) => {
+        st.desc = ev.target.value.trim();
+        if (si === 0) book.cast[name].voiceDesc = st.desc;
+        saveBookSoon();
+      });
+      stDesc.addEventListener('change', () => clearUrlCache());
       const stTags = sr.querySelector('.stage-tags');
       stTags.addEventListener('input', (ev) => {
         st.tags = ev.target.value.trim();
