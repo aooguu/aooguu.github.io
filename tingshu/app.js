@@ -3,7 +3,7 @@
 const DEFAULT_BASE = 'https://api.xiaomimimo.com/v1';
 const AI_DEFAULT_BASE = 'https://api.deepseek.com/v1';
 const AI_DEFAULT_MODEL = 'deepseek-chat';
-const APP_VER = 'v17';
+const APP_VER = 'v18';
 const VOICES = [
   { id: '冰糖', label: '冰糖 · 中文女声' },
   { id: '茉莉', label: '茉莉 · 中文女声' },
@@ -709,7 +709,6 @@ function speechCard(entry, stage) {
   return (desc + '。' + style).slice(0, 160);
 }
 
-const STABLE_TAGS = new Set(['磁性', '醇厚', '清亮', '空灵', '稚嫩', '苍老', '甜美', '沙哑', '醇雅', '御姐音', '正太音', '大叔音', '夹子音', '台湾腔', '东北话', '四川话', '河南话', '粤语', '低沉']);
 const LINE_TAG_DROP = new Set(['无', '正常', '不变', '自然', '普通']);
 
 function cleanLineTags(v) {
@@ -724,13 +723,6 @@ function cleanLineTags(v) {
     if (out.length >= 4) break;
   }
   return out.join(' ');
-}
-
-function identityCard(entry, stage) {
-  const desc = String(stage?.desc || entry?.voiceDesc || '').trim();
-  const stable = stageTags(stage, entry).split(/\s+/).filter((t) => STABLE_TAGS.has(t) && !desc.includes(t));
-  const out = [desc, stable.join(' ')].filter(Boolean).join('，');
-  return out.slice(0, 160);
 }
 
 function analyzeBook(text) {
@@ -1086,7 +1078,7 @@ async function requestTTS(text, voice, tags, card, signal, cloneUri) {
   const base = (s.baseUrl || DEFAULT_BASE).replace(/\/+$/, '');
   const tagStr = cleanTagList(tags);
   const clone = String(cloneUri || '').trim();
-  const cardText = clone ? '' : String(card || '').trim().slice(0, 200);
+  const cardText = String(card || '').trim().slice(0, 200);
   const messages = [];
   if (cardText) messages.push({ role: 'user', content: cardText });
   messages.push({ role: 'assistant', content: (tagStr ? `（${tagStr.replace(/\s+/g, '，')}）` : '') + text });
@@ -1241,20 +1233,14 @@ async function getSegmentAudio(seg) {
     voice = isGenderVoice(seg.speaker)
       ? (seg.speaker === '女声' ? '茉莉' : '苏打')
       : (entry?.voice || (seg.speaker === '旁白' ? '冰糖' : '苏打'));
-    if (lineTags) {
-      tags = lineTags;
-      card = identityCard(entry, stage);
-    } else {
-      tags = stageTags(stage, entry);
-      card = speechCard(entry, stage);
-    }
+    tags = lineTags || stageTags(stage, entry);
+    card = speechCard(entry, stage);
     if (entry?.clone) {
       const owner = entry.cloneOwner || (fpNarrator ? b.protagonist : seg.speaker);
       const cs = await getCloneSample(b.id, owner);
       if (cs?.dataUri) {
         cloneUri = cs.dataUri;
         cloneHash = cs.hash || 'n';
-        card = '';
       } else if (!cloneMissingWarned.has(owner)) {
         cloneMissingWarned.add(owner);
         toast(`「${owner}」的克隆样本不在本机，暂用预设音色`, 4000);
@@ -1890,7 +1876,7 @@ function renderCast() {
       let cloneUri = '';
       if (pe?.clone) {
         const cs = await getCloneSample(book.id, pe.cloneOwner || owner);
-        if (cs?.dataUri) { cloneUri = cs.dataUri; card = ''; }
+        if (cs?.dataUri) cloneUri = cs.dataUri;
       }
       previewVoice(`你好，我是${who}。`, voice, tags, card, cloneUri);
     });
@@ -1980,7 +1966,7 @@ function renderCast() {
         let cloneUri = '';
         if (book.cast[name]?.clone) {
           const cs = await getCloneSample(book.id, book.cast[name].cloneOwner || name);
-          if (cs?.dataUri) { cloneUri = cs.dataUri; card = ''; }
+          if (cs?.dataUri) cloneUri = cs.dataUri;
         }
         previewVoice(`你好，我是${name}。`, voice, stageTags(st, book.cast[name]), card, cloneUri);
       });
@@ -3820,10 +3806,8 @@ async function chatTTSBlob(m) {
     const cs = await getCloneSample(book.id, m.speaker);
     if (cs?.dataUri) cloneUri = cs.dataUri;
   }
-  if (!cloneUri) {
-    tags = entry ? stageTags(null, entry) : '';
-    card = entry ? speechCard(entry, null) : '';
-  }
+  tags = entry ? stageTags(null, entry) : '';
+  card = entry ? speechCard(entry, null) : '';
   const blob = await requestTTS(m.text, voice, tags, card, undefined, cloneUri);
   const dur = Math.round(await audioDuration(blob));
   const id = uid();
