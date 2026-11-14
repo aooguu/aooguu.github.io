@@ -1,6 +1,8 @@
 /* TXT 听书 — 本地解析 + 小米 MiMo TTS 合成 */
 
 const DEFAULT_BASE = 'https://api.xiaomimimo.com/v1';
+const AI_DEFAULT_BASE = 'https://api.deepseek.com/v1';
+const AI_DEFAULT_MODEL = 'deepseek-chat';
 const VOICES = [
   { id: '冰糖', label: '冰糖 · 中文女声' },
   { id: '茉莉', label: '茉莉 · 中文女声' },
@@ -32,14 +34,12 @@ function saveSettings(patch) {
 }
 
 function loadAi() {
+  const cfg = { baseUrl: AI_DEFAULT_BASE, key: '', model: AI_DEFAULT_MODEL };
   try {
-    return Object.assign(
-      { baseUrl: '', key: '', model: '' },
-      JSON.parse(localStorage.getItem('tts.ai') || '{}')
-    );
-  } catch {
-    return { baseUrl: '', key: '', model: '' };
-  }
+    const saved = JSON.parse(localStorage.getItem('tts.ai') || '{}') || {};
+    for (const k of Object.keys(cfg)) if (saved[k]) cfg[k] = saved[k];
+  } catch {}
+  return cfg;
 }
 function saveAi(patch) {
   const s = Object.assign(loadAi(), patch);
@@ -1635,7 +1635,7 @@ async function aiChat(messages, { json = false, signal } = {}) {
   const key = (cfg.key || '').trim();
   const model = (cfg.model || '').trim();
   const base = (cfg.baseUrl || '').trim().replace(/\/+$/, '');
-  if (!base || !key || !model) throw new Error('请先在设置里填写 AI 接口地址、Key 和模型');
+  if (!base || !key || !model) throw new Error('请先在设置里填写 AI API Key');
   const body = { model, messages, temperature: 0.2 };
   if (json) body.response_format = { type: 'json_object' };
   const send = () => fetch(base + '/chat/completions', {
@@ -1946,7 +1946,7 @@ async function aiAnalyzeBook() {
   if (!book) return;
   const cfg = loadAi();
   if (!cfg.baseUrl || !cfg.key || !cfg.model) {
-    toast('先在设置里填写 AI 接口、Key 和模型');
+    toast('先在设置里填写 DeepSeek API Key');
     showView('settings');
     return;
   }

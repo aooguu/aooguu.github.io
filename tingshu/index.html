@@ -67,22 +67,25 @@
     <div class="card">
       <div class="card-title">AI 角色解析 <span class="hint">可选</span></div>
       <label class="field">
-        <span>接口地址</span>
-        <input id="aiBaseUrl" type="url" placeholder="https://api.example.com/v1" autocomplete="off" spellcheck="false">
+        <span>DeepSeek API Key</span>
+        <input id="aiKey" type="password" placeholder="sk-..." autocomplete="off" spellcheck="false">
       </label>
-      <label class="field">
-        <span>API Key</span>
-        <input id="aiKey" type="password" placeholder="服务商提供的 Key" autocomplete="off" spellcheck="false">
-      </label>
-      <label class="field">
-        <span>模型</span>
-        <input id="aiModel" type="text" placeholder="如 deepseek-chat / mimo-v2.6-flash" autocomplete="off" spellcheck="false">
-      </label>
+      <details class="adv">
+        <summary>高级：更换接口 / 模型</summary>
+        <label class="field">
+          <span>接口地址</span>
+          <input id="aiBaseUrl" type="url" autocomplete="off" spellcheck="false">
+        </label>
+        <label class="field">
+          <span>模型</span>
+          <input id="aiModel" type="text" autocomplete="off" spellcheck="false">
+        </label>
+      </details>
       <div class="row">
         <button id="btnAiTest" class="btn">连接测试</button>
         <button id="btnSaveAi" class="btn primary">保存</button>
       </div>
-      <p class="hint">用你自己的模型按章分析角色、性别、音色和语气；Key 只存本机，调用会产生你账号的费用。</p>
+      <p class="hint">默认使用 DeepSeek（deepseek-chat），只需填 Key；也支持其他 OpenAI 兼容接口。Key 只存本机，调用会产生你账号的费用。</p>
     </div>
 
     <div class="card">
