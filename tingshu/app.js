@@ -3,7 +3,7 @@
 const DEFAULT_BASE = 'https://api.xiaomimimo.com/v1';
 const AI_DEFAULT_BASE = 'https://api.deepseek.com/v1';
 const AI_DEFAULT_MODEL = 'deepseek-chat';
-const APP_VER = 'v7';
+const APP_VER = 'v8';
 const VOICES = [
   { id: '冰糖', label: '冰糖 · 中文女声' },
   { id: '茉莉', label: '茉莉 · 中文女声' },
@@ -715,6 +715,8 @@ const audioEl = new Audio();
 audioEl.preload = 'auto';
 const urlCache = new Map();
 const inflight = new Map();
+const PREFETCH_AHEAD = 4;
+let aheadGen = 0;
 let previewAudio = null;
 let wakeLock = null;
 let exporting = false;
@@ -807,16 +809,19 @@ function ensureCastEntries() {
   }
   return n;
 }
-function castEntryAt(name, chapter) {
+function castStageFor(name, chapter) {
   const e = (book && book.cast || {})[name];
-  if (!e) return null;
-  if (!e.stages || e.stages.length < 2) return e;
+  if (!e) return { entry: null, stage: null };
+  if (!e.stages || e.stages.length < 2) return { entry: e, stage: null };
   let st = null;
   for (const s of e.stages) {
     if (chapter >= s.from) st = s;
   }
   if (!st) st = e.stages[0];
-  return Object.assign({}, e, st);
+  return { entry: Object.assign({}, e, st), stage: st };
+}
+function castEntryAt(name, chapter) {
+  return castStageFor(name, chapter).entry;
 }
 
 function saveProgress() {
@@ -923,30 +928,94 @@ async function designVoice(desc, signal) {
   throw lastErr || new Error('音色生成失败');
 }
 
+const voiceDesignInflight = new Map();
+const voiceDesignFailed = new Set();
+let voiceDesignToastAt = 0;
+
+async function ensureDesignSample(bookId, owner, label, holder, desc) {
+  const d = String(desc || '').trim();
+  if (!d) return '';
+  const dref = await descRef(d);
+  const refs = [];
+  if (holder?.sampleRef) refs.push(holder.sampleRef);
+  refs.push(dref);
+  for (const ref of [...new Set(refs)]) {
+    const uri = await getVoiceSample(bookId, owner, ref);
+    if (uri) {
+      if (holder && !holder.sampleRef) {
+        holder.sampleRef = ref;
+        holder.sampleDesc = d;
+        saveBookSoon();
+      }
+      return uri;
+    }
+  }
+  const k = voiceKey(bookId, owner, 'design') + '|' + dref;
+  if (voiceDesignFailed.has(k)) return '';
+  if (voiceDesignInflight.has(k)) return voiceDesignInflight.get(k);
+  const p = (async () => {
+    if (Date.now() - voiceDesignToastAt > 4000) {
+      voiceDesignToastAt = Date.now();
+      toast(`正在为「${label}」生成专属音色…`, 15000);
+    }
+    const uri = await designVoice(d);
+    await putVoiceSample(bookId, owner, uri, d, dref);
+    if (holder) {
+      holder.sampleRef = dref;
+      holder.sampleDesc = d;
+      holder.sampleId = Date.now();
+      if (holder.stages) {
+        holder.voiceMode = 'design';
+        holder.voiceDesc = holder.voiceDesc || d;
+      }
+      saveBookSoon();
+    }
+    return uri;
+  })();
+  voiceDesignInflight.set(k, p);
+  try {
+    return await p;
+  } catch {
+    voiceDesignFailed.add(k);
+    toast(`「${label}」专属音色生成失败，暂时用预设音色`, 6000);
+    return '';
+  } finally {
+    voiceDesignInflight.delete(k);
+  }
+}
+
 async function getSegmentAudio(seg) {
   const b = book;
   const s = loadSettings();
-  let voice = '冰糖', style = '', sample = '';
-  let entry = castEntryAt(seg.speaker, chapterIdx);
+  let voice = '冰糖', style = '', sample = '', desc = '';
   let sampleOwner = seg.speaker;
+  const own = castStageFor(seg.speaker, chapterIdx);
+  let entry = own.entry, stage = own.stage;
+  let realEntry = (b.cast || {})[seg.speaker] || null;
   if (seg.speaker === '旁白' && b.firstPerson && b.protagonist && b.protagonist !== '我') {
     sampleOwner = b.protagonist;
-    const p = castEntryAt(b.protagonist, chapterIdx);
-    if (p) entry = Object.assign({}, entry, p);
+    const pr = castStageFor(b.protagonist, chapterIdx);
+    if (pr.entry) {
+      entry = Object.assign({}, entry, pr.entry);
+      stage = pr.stage;
+      realEntry = (b.cast || {})[b.protagonist] || null;
+    }
   }
-  const ref = entry?.sampleRef || '';
   if (!s.singleVoice) {
     voice = entry?.voice || (seg.speaker === '旁白' ? '冰糖' : '苏打');
     style = entry?.style || '';
     if (entry?.voiceMode === 'design') {
-      if (entry.stages && entry.stages.length > 1) {
-        if (ref) sample = await getVoiceSample(b.id, sampleOwner, ref);
-      } else {
-        sample = await getEntrySample(b.id, sampleOwner, entry);
-      }
+      desc = String((stage && stage.desc) || entry.voiceDesc || '').trim();
+      const ref = stage ? (stage.sampleRef || '') : (entry.sampleRef || '');
+      if (ref) sample = await getVoiceSample(b.id, sampleOwner, ref);
+      if (!sample && desc) sample = await getVoiceSample(b.id, sampleOwner, await descRef(desc));
+      if (!sample && desc) sample = await ensureDesignSample(b.id, sampleOwner, seg.speaker, stage || realEntry, desc);
     }
   }
-  const key = await hashKey([b.id, voice, style, seg.text, entry?.sampleId || '', ref, sample ? 'c' : 'p', 'v' + TTS_CACHE_VER].join('\u0000'));
+  const tagRef = stage ? (stage.sampleRef || '') : (realEntry?.sampleRef || entry?.sampleRef || '');
+  const tagId = (stage && stage.sampleId) || realEntry?.sampleId || entry?.sampleId || '';
+  const stamp = sample ? `c:${tagRef || (desc ? await descRef(desc) : 'x')}:${tagId}` : `p:${voice}`;
+  const key = await hashKey([b.id, style, seg.text, stamp, 'v' + TTS_CACHE_VER].join('\u0000'));
   const rec = await idb.get('audio', key);
   if (rec?.blob) return rec.blob;
   const blob = await requestTTS(seg.text, voice, style, undefined, sample);
@@ -955,6 +1024,7 @@ async function getSegmentAudio(seg) {
 }
 
 function clearUrlCache() {
+  aheadGen++;
   for (const v of urlCache.values()) URL.revokeObjectURL(v.url);
   urlCache.clear();
   inflight.clear();
@@ -972,6 +1042,17 @@ async function prefetch(i) {
     return url;
   }).catch(() => null).finally(() => inflight.delete(i));
   inflight.set(i, p);
+  return p;
+}
+
+function prefetchAhead(i) {
+  const gen = ++aheadGen;
+  (async () => {
+    for (let k = 1; k <= PREFETCH_AHEAD; k += 2) {
+      if (gen !== aheadGen || !book) return;
+      await Promise.all([prefetch(i + k), prefetch(i + k + 1)]);
+    }
+  })();
 }
 
 /* ---------------- 播放 ---------------- */
@@ -1006,6 +1087,7 @@ async function playIndex(i) {
     audioEl.src = finalUrl;
     await audioEl.play();
     playing = true;
+    prefetchAhead(i);
     requestWakeLock();
   } catch (e) {
     if (e.name === 'AbortError') return;
@@ -1159,6 +1241,9 @@ async function openBook(id) {
     if (syncVoiceToGender(e)) fixed = true;
   }
   if (ensureCastEntries()) fixed = true;
+  for (const e of Object.values(b.cast || {})) {
+    if (normalizeEntryStages(e)) fixed = true;
+  }
   if (b.firstPerson && b.protagonist && b.cast[b.protagonist] && b.cast['旁白']) {
     const nv = b.cast[b.protagonist].voice;
     if (b.cast['旁白'].voice !== nv) { b.cast['旁白'].voice = nv; fixed = true; }
@@ -1216,6 +1301,7 @@ function openChapter(i, goPlayer) {
   renderPlayer();
   updatePlayerBar();
   aiNudgeCheck();
+  if (goPlayer && chapterSegments.length) prefetch(0);
   if (goPlayer) showView('player');
 }
 
@@ -1247,6 +1333,50 @@ function defaultVoiceDesc(gender, tone) {
 function stageHasSample(st) {
   return !!(st && st.sampleRef && st.sampleDesc === st.desc);
 }
+function normalizeEntryStages(e) {
+  if (!e || !Array.isArray(e.stages) || e.stages.length < 2) return false;
+  const out = [];
+  let changed = false;
+  for (const raw of e.stages) {
+    if (!raw) continue;
+    const st = Object.assign({}, raw);
+    const prev = out[out.length - 1];
+    if (prev && sameStagePeriod(prev.label, st.label)) {
+      prev.to = Math.max(prev.to, st.to);
+      if (!prev.desc && st.desc) prev.desc = st.desc;
+      if (!prev.style && st.style) prev.style = st.style;
+      if (!prev.voice && st.voice) prev.voice = st.voice;
+      if (!prev.sampleRef && st.sampleRef && (!st.sampleDesc || st.sampleDesc === st.desc)) {
+        prev.sampleRef = st.sampleRef;
+        prev.sampleDesc = st.sampleDesc;
+        prev.sampleId = st.sampleId;
+        if (st.desc) prev.desc = st.desc;
+      }
+      changed = true;
+      continue;
+    }
+    if (out.length && st.from <= out[out.length - 1].to) changed = true;
+    out.push(st);
+  }
+  if (out.length >= 2) {
+    if (changed) e.stages = out;
+    return changed;
+  }
+  delete e.stages;
+  const st = out[0];
+  if (st) {
+    if (st.desc) e.voiceDesc = st.desc;
+    if (st.style) e.style = st.style;
+    if (st.voice) e.voice = st.voice;
+    if (st.sampleRef) {
+      e.sampleRef = st.sampleRef;
+      e.sampleDesc = st.sampleDesc;
+      e.sampleId = e.sampleId || st.sampleId || Date.now();
+    }
+    if (!e.voiceMode) e.voiceMode = 'design';
+  }
+  return true;
+}
 function collectVoiceTasks() {
   const tasks = [];
   for (const [name, e] of Object.entries(book?.cast || {})) {
@@ -1277,6 +1407,7 @@ async function generateVoiceTasks(tasks) {
       if (t.stage) {
         t.stage.sampleRef = ref;
         t.stage.sampleDesc = t.desc;
+        t.stage.sampleId = Date.now();
       } else {
         e.voiceDesc = t.desc;
         e.sampleRef = ref;
@@ -1295,9 +1426,15 @@ function syncVoiceToGender(entry) {
   const g = entry.gender;
   if (g !== 'F' && g !== 'M') return false;
   const wrong = g === 'F' ? ['苏打', '白桦'] : ['茉莉', '冰糖'];
-  if (!wrong.includes(entry.voice)) return false;
-  entry.voice = g === 'F' ? '茉莉' : '苏打';
-  return true;
+  const good = g === 'F' ? '茉莉' : '苏打';
+  let fixed = false;
+  if (wrong.includes(entry.voice)) { entry.voice = good; fixed = true; }
+  if (Array.isArray(entry.stages)) {
+    for (const st of entry.stages) {
+      if (wrong.includes(st.voice)) { st.voice = good; fixed = true; }
+    }
+  }
+  return fixed;
 }
 
 function genderLabel(g) {
@@ -1425,7 +1562,7 @@ function renderCast() {
         </div>` : ''}
       </div>`;
     }).join('')}
-    <p class="cast-note">${fp ? `第一人称：旁白和对白里的“我”都按主角「${escapeAttr(book.protagonist)}」处理。` : ''}性别和语气由全书统计推断，可点 ? 修改；改名字会把同名的话合并。AI 解析按批推进（每批约 ${(AI_WINDOW_CHARS / 10000).toFixed(0)} 万字），会按章记录角色的年龄阶段；听到离本批结尾约 ${(AI_NUDGE_CHARS / 10000).toFixed(0)} 万字时会提醒继续解析，后续剧情变化会追加新的声音阶段，也可随时改描述微调。<br>语气写法：「苍老」「沙哑」「语速缓慢」这类短词会作为风格标签生效，比“老人音”更可靠；长句作为自然语言指令。</p>`;
+        <p class="cast-note">${fp ? `第一人称：旁白和对白里的“我”都按主角「${escapeAttr(book.protagonist)}」处理。` : ''}性别和语气由全书统计推断，可点 ? 修改；改名字会把同名的话合并。AI 解析按批推进（每批约 ${(AI_WINDOW_CHARS / 10000).toFixed(0)} 万字），会按章记录角色的年龄阶段；同一时期只保留一个音色，不会因为描述措辞不同反复换声。听到离本批结尾约 ${(AI_NUDGE_CHARS / 10000).toFixed(0)} 万字时会提醒继续解析。还没生成音色的阶段，播放时会自动生成一次并复用，之后不会每句重做。<br>语气写法：「苍老」「沙哑」「语速缓慢」这类短词会作为风格标签生效，比“老人音”更可靠；长句作为自然语言指令。</p>`;
 
   panel.querySelectorAll('.cast-row').forEach(row => {
     const name = row.dataset.name;
@@ -1443,12 +1580,14 @@ function renderCast() {
       }
       book.cast[name].voiceMode = 'preset';
       book.cast[name].voice = v;
+      if (book.cast[name].stages) for (const st of book.cast[name].stages) st.voice = v;
       saveBookSoon();
       clearUrlCache();
     });
     row.querySelector('.cast-style').addEventListener('input', (e) => {
       book.cast[name] = book.cast[name] || { voice: '苏打', style: '' };
       book.cast[name].style = e.target.value.trim();
+      if (book.cast[name].stages) for (const st of book.cast[name].stages) st.style = book.cast[name].style;
       saveBookSoon();
     });
     row.querySelector('.cast-preview').addEventListener('click', async () => {
@@ -1460,14 +1599,20 @@ function renderCast() {
         ? book.protagonist
         : name;
       const pe = (book.cast || {})[owner] || entry;
-      let sample = '';
+      let sample = '', desc = '', holder = pe;
       if (pe?.stages && pe.stages.length > 1) {
-        const st = pe.stages[0];
+        const st = pe.stages.find((s) => chapterIdx >= s.from) || pe.stages[0];
         voice = st.voice || voice;
         style = st.style || style;
+        desc = st.desc || '';
+        holder = st;
         if (stageHasSample(st)) sample = await getVoiceSample(book.id, owner, st.sampleRef);
       } else if (pe?.voiceMode === 'design') {
+        desc = pe.voiceDesc || '';
         sample = await getEntrySample(book.id, owner, pe);
+      }
+      if (!sample && desc && pe?.voiceMode === 'design') {
+        sample = await ensureDesignSample(book.id, owner, who, holder, desc);
       }
       previewVoice(`你好，我是${who}。`, pe?.voice || voice, style, sample);
     });
@@ -1494,6 +1639,7 @@ function renderCast() {
           await putVoiceSample(book.id, name, uri, st.desc, ref);
           st.sampleRef = ref;
           st.sampleDesc = st.desc;
+          st.sampleId = Date.now();
           if (book.cast[name]) book.cast[name].voiceMode = 'design';
           saveBookSoon();
           renderCast();
@@ -1576,6 +1722,7 @@ function renderCast() {
         if (!isDesign) {
           const pool = next === 'F' ? ['茉莉', '冰糖'] : next === 'M' ? ['苏打', '白桦'] : ['冰糖', '苏打'];
           book.cast[name].voice = pool[0];
+          if (book.cast[name].stages) for (const st of book.cast[name].stages) st.voice = pool[0];
         }
         saveBookSoon();
         renderCast();
@@ -1759,7 +1906,7 @@ const AI_SYS = `你是中文小说角色分析助手。阅读给出的原文片�
 - aliases：本段中出现的其他叫法、简称、外号（数组，最多3个，没有则为空数组）
 - gender：F（女）、M（男）或 ?（无法判断），依据“她/他”、身份称谓、亲属关系判断
 - voice：从 冰糖(清亮女声)、茉莉(温柔女声)、苏打(清朗男声)、白桦(低沉男声) 中选一个最贴合的
-- stage：这个角色在本段所处的阶段标签（如 童年/少年/青年/中年/老年/不变，2-4字）；整本书没有明显阶段变化就统一写“不变”
+- stage：这个角色在本段所处的阶段，只能填 童年/少年/青年/中年/老年/不变 之一（同一角色处于同一时期必须用同一个词；没有明显变化就填“不变”）
 - voiceDesc：20-40字的音色描述，只写本段这个阶段的年龄、性别、音质、语速，用于生成自定义音色，例如“八岁男孩，声音清脆，语速偏快”；不要写台词
 - tone：不超过12个字的语气指令，概括这个角色本段说话的风格
 这是长篇小说的一个片段，人物可能随剧情长大或变老。同一人物在不同片段处于不同年龄/身份阶段时，stage 和 voiceDesc 要如实反映该阶段；处于同一阶段时请保持相同的阶段标签和尽量一致的描述，避免重复刷新。
@@ -1966,6 +2113,29 @@ function aiResolve(acc) {
   return out.sort((a, b) => b.hits - a.hits);
 }
 
+const STAGE_WORDS = [
+  [/(?:童年|幼年|幼时|孩童|孩子|小孩|小时候|幼)/, '童年'],
+  [/(?:少年|少女|少时|青少年)/, '少年'],
+  [/(?:青年|成年|青年期|长大后)/, '青年'],
+  [/(?:中年|壮年)/, '中年'],
+  [/(?:老年|晚年|暮年|年老)/, '老年'],
+];
+function stagePeriod(label) {
+  const s = String(label || '').trim();
+  if (!s || s === '不变' || s === '未变' || s === '无') return '';
+  for (const [re, word] of STAGE_WORDS) if (re.test(s)) return word;
+  return s;
+}
+const STAGE_RANK = { 童年: 1, 少年: 2, 青年: 3, 中年: 4, 老年: 5 };
+function sameStagePeriod(prevLabel, nextLabel) {
+  const x = stagePeriod(nextLabel), y = stagePeriod(prevLabel);
+  if (!x) return true;
+  if (!y) return false;
+  const rx = STAGE_RANK[x], ry = STAGE_RANK[y];
+  if (rx && ry) return rx <= ry;
+  return x === y;
+}
+
 function aiBuildStages(chunkResults, canonOf) {
   const byChar = new Map();
   for (const cr of chunkResults) {
@@ -1999,7 +2169,7 @@ function aiBuildStages(chunkResults, canonOf) {
         stages.push({ from: r.from, to: r.to, label: r.label, desc: r.desc, tone: r.tone, voice: r.voice });
         continue;
       }
-      const sameLabel = !!(r.label && prev.label && r.label === prev.label);
+      const sameLabel = sameStagePeriod(prev.label, r.label);
       const sameDesc = !!(r.desc && prev.desc && r.desc === prev.desc);
       if (r.desc && prev.desc && !sameDesc && !sameLabel) {
         stages.push({ from: r.from, to: r.to, label: r.label, desc: r.desc, tone: r.tone, voice: r.voice });
@@ -2164,7 +2334,7 @@ async function aiApplySelection() {
       if (!s.desc) continue;
       const last = merged[merged.length - 1];
       if (last) {
-        const sameLabel = !!(s.label && last.label && s.label === last.label);
+        const sameLabel = sameStagePeriod(last.label, s.label);
         if (last.desc === s.desc || sameLabel) {
           last.to = Math.max(last.to, s.to);
           if (!last.sampleRef && !last.sampleDesc && s.desc !== last.desc) last.desc = s.desc;
@@ -2191,15 +2361,18 @@ async function aiApplySelection() {
       entry.style = dedup[0].style || entry.style || r.tone;
       entry.voiceDesc = dedup[0].desc;
       delete entry.sampleId;
+      delete entry.sampleRef;
+      delete entry.sampleDesc;
     } else {
       delete entry.stages;
+      const single = dedup[0];
       if (r.voiceDesc) entry.voiceDesc = r.voiceDesc;
       entry.voice = r.voice || entry.voice;
       entry.style = r.tone || entry.style;
-      if (entry.sampleId && prevDesc !== entry.voiceDesc) {
-        delete entry.sampleId;
-        delete entry.sampleRef;
-        delete entry.sampleDesc;
+      if (single?.sampleRef && single.sampleDesc === single.desc) {
+        entry.sampleRef = single.sampleRef;
+        entry.sampleDesc = single.sampleDesc;
+        entry.sampleId = entry.sampleId || single.sampleId || Date.now();
       }
     }
     entry.voiceMode = 'design';
