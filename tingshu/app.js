@@ -3,7 +3,7 @@
 const DEFAULT_BASE = 'https://api.xiaomimimo.com/v1';
 const AI_DEFAULT_BASE = 'https://api.deepseek.com/v1';
 const AI_DEFAULT_MODEL = 'deepseek-chat';
-const APP_VER = 'v19';
+const APP_VER = 'v20';
 const VOICES = [
   { id: '冰糖', label: '冰糖 · 中文女声' },
   { id: '茉莉', label: '茉莉 · 中文女声' },
@@ -3643,6 +3643,7 @@ async function openChatGroup(id) {
   if (chatAudio && !chatAudio.paused) chatAudio.pause();
   chat = c;
   if (!Array.isArray(chat.messages)) chat.messages = [];
+  chatNormalizeStickerText();
   chatReplyToken++;
   chatBusy = false;
   $('chatTyping').hidden = true;
@@ -3849,13 +3850,36 @@ async function chatPlayVoiceMsg(m, el) {
 function chatExtractStickers(text) {
   let rest = String(text || '');
   const found = [];
-  const re = /\[([^\[\]]{1,12})\]/g;
+  const raws = [];
+  const re = /[\[【]\s*(?:(?:表情|表情包|贴纸|sticker)\s*[:：]?\s*)?([^\[\]【】\r\n]{1,12})\s*[\]】]|（\s*表情\s*[:：]?\s*([^（）\r\n]{1,12})\s*）/gi;
   let m;
   while ((m = re.exec(rest))) {
-    if (chatStickerMap.has(m[1]) && !found.includes(m[1])) found.push(m[1]);
+    const n = (m[1] || m[2] || '').trim();
+    if (chatStickerMap.has(n) && !found.includes(n)) { found.push(n); raws.push(m[0]); }
   }
-  for (const n of found) rest = rest.split(`[${n}]`).join('');
+  for (const raw of raws) rest = rest.split(raw).join('');
   return { text: rest.replace(/\s{2,}/g, ' ').trim(), stickers: found };
+}
+
+function chatNormalizeStickerText() {
+  if (!chat || !Array.isArray(chat.messages)) return;
+  let changed = false;
+  const out = [];
+  for (const m of chat.messages) {
+    if (m.role === 'char' && m.type === 'text' && m.text) {
+      const ex = chatExtractStickers(m.text);
+      if (ex.stickers.length) {
+        changed = true;
+        if (ex.text) out.push(Object.assign({}, m, { text: ex.text }));
+        for (const s of ex.stickers) {
+          out.push({ id: uid(), at: m.at || Date.now(), role: 'char', speaker: m.speaker, type: 'sticker', sticker: s });
+        }
+        continue;
+      }
+    }
+    out.push(m);
+  }
+  if (changed) { chat.messages = out; chatSaveSoon(); }
 }
 
 function chatMemberBrief(name) {
@@ -3888,7 +3912,7 @@ ${members}
 - 只输出 1-${chat.replyMax} 条消息，像即时聊天一样短，每条 6-40 字，口语化，可以带（）里的动作。
 - speaker 必须是成员名字之一，保持各角色的性格和说话习惯。
 - 可以自然接话、吐槽、互怼，但不要替用户说话，也不要写旁白。
-- 想发表情时，在 text 末尾用 [表情名]；可用表情：${stickerNames}。表情名必须与列表完全一致，不要自造。
+- 想发表情时，在 text 末尾只写方括号包住的表情名，如 [偷笑]；不要加“表情”二字，不要用【】。可用表情：${stickerNames}。表情名必须与列表完全一致，不要自造。
 - 只输出 JSON：{"replies":[{"speaker":"角色名","text":"内容"}]}
 - 不要输出解释。`;
 }
@@ -3896,7 +3920,7 @@ ${members}
 function chatHistoryMessage() {
   const recent = chat.messages.filter((m) => m.type !== 'sys').slice(-CHAT_HISTORY);
   const lines = recent.map((m) => {
-    if (m.type === 'sticker') return `${m.role === 'user' ? '我' : m.speaker}：[表情:${m.sticker}]`;
+    if (m.type === 'sticker') return `${m.role === 'user' ? '我' : m.speaker}：[${m.sticker}]`;
     if (m.type === 'uservoice') return `我：[语音] ${m.text || '（只发了语音）'}`;
     return `${m.role === 'user' ? '我' : m.speaker}：${m.text || ''}`;
   });
