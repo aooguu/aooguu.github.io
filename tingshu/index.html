@@ -65,6 +65,27 @@
     </div>
 
     <div class="card">
+      <div class="card-title">AI 角色解析 <span class="hint">可选</span></div>
+      <label class="field">
+        <span>接口地址</span>
+        <input id="aiBaseUrl" type="url" placeholder="https://api.example.com/v1" autocomplete="off" spellcheck="false">
+      </label>
+      <label class="field">
+        <span>API Key</span>
+        <input id="aiKey" type="password" placeholder="服务商提供的 Key" autocomplete="off" spellcheck="false">
+      </label>
+      <label class="field">
+        <span>模型</span>
+        <input id="aiModel" type="text" placeholder="如 deepseek-chat / mimo-v2.6-flash" autocomplete="off" spellcheck="false">
+      </label>
+      <div class="row">
+        <button id="btnAiTest" class="btn">连接测试</button>
+        <button id="btnSaveAi" class="btn primary">保存</button>
+      </div>
+      <p class="hint">用你自己的模型按章分析角色、性别、音色和语气；Key 只存本机，调用会产生你账号的费用。</p>
+    </div>
+
+    <div class="card">
       <div class="card-title">播放</div>
       <label class="switch-row">
         <span>只用一个音色朗读全书</span>
@@ -90,6 +111,20 @@
     </div>
   </section>
 </main>
+
+<div id="aiOverlay" class="overlay" hidden>
+  <div class="modal">
+    <div class="modal-head">
+      <span id="aiTitle">AI 解析</span>
+      <button id="aiClose" class="icon-btn" title="关闭">✕</button>
+    </div>
+    <div id="aiBody" class="modal-body"></div>
+    <div class="modal-foot">
+      <button id="aiCancel" class="btn">取消</button>
+      <button id="aiApply" class="btn primary" hidden>应用所选</button>
+    </div>
+  </div>
+</div>
 
 <footer id="playerBar" hidden>
   <div class="pb-main" id="pbMain">

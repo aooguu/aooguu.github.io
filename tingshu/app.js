@@ -31,17 +31,37 @@ function saveSettings(patch) {
   return s;
 }
 
+function loadAi() {
+  try {
+    return Object.assign(
+      { baseUrl: '', key: '', model: '' },
+      JSON.parse(localStorage.getItem('tts.ai') || '{}')
+    );
+  } catch {
+    return { baseUrl: '', key: '', model: '' };
+  }
+}
+function saveAi(patch) {
+  const s = Object.assign(loadAi(), patch);
+  localStorage.setItem('tts.ai', JSON.stringify(s));
+  return s;
+}
+
 /* ---------------- IndexedDB ---------------- */
 let db = null;
 function openDB() {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open('tingshu', 1);
+    const req = indexedDB.open('tingshu', 2);
     req.onupgradeneeded = () => {
       const d = req.result;
       if (!d.objectStoreNames.contains('books')) d.createObjectStore('books', { keyPath: 'id' });
       if (!d.objectStoreNames.contains('audio')) {
         const s = d.createObjectStore('audio', { keyPath: 'key' });
         s.createIndex('bookId', 'bookId');
+      }
+      if (!d.objectStoreNames.contains('voices')) {
+        const v = d.createObjectStore('voices', { keyPath: 'key' });
+        v.createIndex('bookId', 'bookId');
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -80,6 +100,33 @@ function deleteAudioOfBook(bookId) {
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });
+}
+function deleteVoicesOfBook(bookId) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('voices', 'readwrite');
+    const idx = tx.objectStore('voices').index('bookId');
+    const req = idx.openCursor(IDBKeyRange.only(bookId));
+    req.onsuccess = () => {
+      const cur = req.result;
+      if (cur) { cur.delete(); cur.continue(); }
+    };
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+const voiceSampleMem = new Map();
+async function getVoiceSample(bookId, name) {
+  const k = bookId + ':' + name;
+  if (voiceSampleMem.has(k)) return voiceSampleMem.get(k);
+  let v = '';
+  try { v = (await idb.get('voices', k))?.dataUri || ''; } catch {}
+  voiceSampleMem.set(k, v);
+  return v;
+}
+async function putVoiceSample(bookId, name, dataUri, desc) {
+  const k = bookId + ':' + name;
+  await idb.put('voices', { key: k, bookId, name, dataUri, desc, createdAt: Date.now() });
+  voiceSampleMem.set(k, dataUri);
 }
 
 /* ---------------- 小工具 ---------------- */
@@ -722,6 +769,26 @@ function defaultCast(b) {
 }
 
 
+function castEntryFor(name) {
+  book.cast = book.cast || {};
+  let e = book.cast[name];
+  if (e) return e;
+  const list = book.detected || [];
+  const d = list.find((x) => x.name === name) || list.find((x) => canonical(x.name) === name);
+  const g = d?.gender || '?';
+  e = { voice: g === 'F' ? '茉莉' : g === 'M' ? '苏打' : '冰糖', style: d?.tone || '', gender: g };
+  book.cast[name] = e;
+  return e;
+}
+function ensureCastEntries() {
+  if (!book) return 0;
+  let n = 0;
+  for (const [name] of castList()) {
+    if (!book.cast[name]) { castEntryFor(name); n++; }
+  }
+  return n;
+}
+
 function saveProgress() {
   if (!book) return;
   try {
@@ -740,16 +807,23 @@ function saveBookSoon() {
 }
 
 /* ---------------- 合成 ---------------- */
-async function requestTTS(text, voice, style, signal) {
+const TTS_CACHE_VER = 3;
+const VOICE_DESIGN_TEXT = '你来了。夜里的风有些凉，先进屋坐坐吧，我给你倒杯热茶。';
+
+async function requestTTS(text, voice, style, signal, sample) {
   const s = loadSettings();
   const apiKey = (s.apiKey || '').trim();
   if (!apiKey) throw new Error('请先在设置里填写 API Key');
   const base = (s.baseUrl || DEFAULT_BASE).replace(/\/+$/, '');
+  const cleanStyle = String(style || '').replace(/[()（）\[\]\r\n]/g, ' ').replace(/\s+/g, ' ').trim();
   const messages = [];
-  if (style && style.trim()) messages.push({ role: 'user', content: style.trim() });
-  messages.push({ role: 'assistant', content: text });
+  if (cleanStyle) messages.push({ role: 'user', content: cleanStyle });
+  const tagged = cleanStyle && cleanStyle.length <= 16 ? `（${cleanStyle}）${text}` : text;
+  messages.push({ role: 'assistant', content: tagged });
 
-  const body = JSON.stringify({ model: 'mimo-v2.5-tts', messages, audio: { format: 'mp3', voice } });
+  const body = JSON.stringify(sample
+    ? { model: 'mimo-v2.5-tts-voiceclone', messages, audio: { format: 'mp3', voice: sample } }
+    : { model: 'mimo-v2.5-tts', messages, audio: { format: 'mp3', voice } });
   let lastErr = null;
   for (let attempt = 0; attempt < 2; attempt++) {
     let res;
@@ -778,19 +852,69 @@ async function requestTTS(text, voice, style, signal) {
   throw lastErr || new Error('合成失败');
 }
 
+async function designVoice(desc, signal) {
+  const s = loadSettings();
+  const apiKey = (s.apiKey || '').trim();
+  if (!apiKey) throw new Error('请先在设置里填写 API Key');
+  const base = (s.baseUrl || DEFAULT_BASE).replace(/\/+$/, '');
+  const body = JSON.stringify({
+    model: 'mimo-v2.5-tts-voicedesign',
+    messages: [
+      { role: 'user', content: String(desc || '').trim() },
+      { role: 'assistant', content: VOICE_DESIGN_TEXT },
+    ],
+    audio: { format: 'mp3' },
+  });
+  let lastErr = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let res;
+    try {
+      res = await fetch(base + '/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'api-key': apiKey },
+        body,
+        signal,
+      });
+    } catch (e) {
+      if (e.name === 'AbortError') throw e;
+      lastErr = e; continue;
+    }
+    if (!res.ok) {
+      let msg = `HTTP ${res.status}`;
+      try { const j = await res.json(); msg = j?.error?.message || msg; } catch {}
+      if (res.status === 429 || res.status >= 500) { lastErr = new Error(msg); await new Promise(r => setTimeout(r, 1200)); continue; }
+      throw new Error(msg);
+    }
+    const j = await res.json();
+    const b64 = j?.choices?.[0]?.message?.audio?.data;
+    if (!b64) throw new Error('接口没有返回音频');
+    return 'data:audio/mpeg;base64,' + b64;
+  }
+  throw lastErr || new Error('音色生成失败');
+}
+
 async function getSegmentAudio(seg) {
   const b = book;
   const s = loadSettings();
-  let voice = '冰糖', style = '';
+  let voice = '冰糖', style = '', sample = '';
+  let entry = (b.cast || {})[seg.speaker];
+  let sampleOwner = seg.speaker;
+  if (seg.speaker === '旁白' && b.firstPerson && b.protagonist && b.protagonist !== '我') {
+    sampleOwner = b.protagonist;
+    const p = (b.cast || {})[b.protagonist];
+    if (p) entry = Object.assign({}, entry, p);
+  }
   if (!s.singleVoice) {
-    const entry = (b.cast || {})[seg.speaker];
     voice = entry?.voice || (seg.speaker === '旁白' ? '冰糖' : '苏打');
     style = entry?.style || '';
+    if (entry?.voiceMode === 'design' && entry.sampleId) {
+      sample = await getVoiceSample(b.id, sampleOwner);
+    }
   }
-  const key = await hashKey([b.id, voice, style, seg.text].join('\u0000'));
+  const key = await hashKey([b.id, voice, style, seg.text, entry?.sampleId || '', sample ? 'c' : 'p', 'v' + TTS_CACHE_VER].join('\u0000'));
   const rec = await idb.get('audio', key);
   if (rec?.blob) return rec.blob;
-  const blob = await requestTTS(seg.text, voice, style);
+  const blob = await requestTTS(seg.text, voice, style, undefined, sample);
   await idb.put('audio', { key, bookId: b.id, blob, size: blob.size, createdAt: Date.now() });
   return blob;
 }
@@ -975,6 +1099,7 @@ async function renderShelf() {
       e.stopPropagation();
       if (!confirm(`删除《${b.title}》和它的全部音频缓存？`)) return;
       await deleteAudioOfBook(b.id);
+      await deleteVoicesOfBook(b.id);
       await idb.del('books', b.id);
       localStorage.removeItem('tts.progress.' + b.id);
       renderShelf();
@@ -991,6 +1116,19 @@ async function openBook(id) {
   if (!b.cast) b.cast = defaultCast(b);
   if (!b.aliases) b.aliases = {};
   book = b;
+  let fixed = false;
+  for (const d of b.detected || []) {
+    const e = b.cast[d.name];
+    if (!e) continue;
+    if ((!e.gender || e.gender === '?') && d.gender) { e.gender = d.gender; fixed = true; }
+    if (syncVoiceToGender(e)) fixed = true;
+  }
+  if (ensureCastEntries()) fixed = true;
+  if (b.firstPerson && b.protagonist && b.cast[b.protagonist] && b.cast['旁白']) {
+    const nv = b.cast[b.protagonist].voice;
+    if (b.cast['旁白'].voice !== nv) { b.cast['旁白'].voice = nv; fixed = true; }
+  }
+  if (fixed) idb.put('books', b).catch(() => {});
   const p = loadProgress(b.id) || { chapter: 0, segment: 0 };
   chapterIdx = Math.min(p.chapter || 0, b.chapters.length - 1);
   chapterSegments = buildSegments(b.chapters[chapterIdx].content);
@@ -1060,8 +1198,42 @@ function castList() {
   return [...map.entries()].sort((a, b) => b[1].count - a[1].count);
 }
 
-function voiceOptions(selected) {
-  return VOICES.map(v => `<option value="${v.id}"${v.id === selected ? ' selected' : ''}>${v.label}</option>`).join('');
+function voiceOptions(selected, allowDesign) {
+  const opts = VOICES.map(v => `<option value="${v.id}"${v.id === selected ? ' selected' : ''}>${v.label}</option>`).join('');
+  return opts + (allowDesign ? `<option value="__design"${selected === '__design' ? ' selected' : ''}>声音设计（自定义音色）</option>` : '');
+}
+function defaultVoiceDesc(gender, tone) {
+  const base = gender === 'F' ? '女性' : gender === 'M' ? '男性' : '中性';
+  const t = String(tone || '').trim();
+  return `${base}嗓音，${t || '自然平和'}。`;
+}
+async function generateVoicesFor(names) {
+  let ok = 0, fail = 0;
+  for (let i = 0; i < names.length; i++) {
+    const n = names[i];
+    const e = (book.cast || {})[n];
+    if (!e || !e.voiceDesc) continue;
+    toast(`生成音色 ${i + 1}/${names.length}：${n}`, 120000);
+    try {
+      const uri = await designVoice(e.voiceDesc);
+      await putVoiceSample(book.id, n, uri, e.voiceDesc);
+      e.voiceMode = 'design';
+      e.sampleId = Date.now();
+      ok++;
+    } catch { fail++; }
+  }
+  saveBookSoon();
+  renderCast();
+  toast(`音色生成完成：${ok} 个${fail ? `，${fail} 个失败` : ''}`, 6000);
+}
+function syncVoiceToGender(entry) {
+  if (!entry || entry.voiceMode === 'design') return false;
+  const g = entry.gender;
+  if (g !== 'F' && g !== 'M') return false;
+  const wrong = g === 'F' ? ['苏打', '白桦'] : ['茉莉', '冰糖'];
+  if (!wrong.includes(entry.voice)) return false;
+  entry.voice = g === 'F' ? '茉莉' : '苏打';
+  return true;
 }
 
 function genderLabel(g) {
@@ -1092,8 +1264,15 @@ function reanalyzeBook() {
   book.cast = book.cast || {};
   for (const [k, v] of Object.entries(dc)) {
     if (!book.cast[k]) book.cast[k] = v;
-    else if (!book.cast[k].gender) book.cast[k].gender = v.gender;
+    else if (!book.cast[k].gender || book.cast[k].gender === '?') book.cast[k].gender = v.gender;
   }
+  for (const d of a.names) {
+    const c = book.cast[d.name];
+    if (!c) continue;
+    if ((d.gender === 'F' || d.gender === 'M') && (!c.gender || c.gender === '?')) c.gender = d.gender;
+    syncVoiceToGender(c);
+  }
+  ensureCastEntries();
   if (book.firstPerson && book.cast[book.protagonist]) {
     book.cast['旁白'].voice = book.cast[book.protagonist].voice;
   }
@@ -1120,6 +1299,8 @@ function renderCast() {
       <span>共识别 ${rows.length} 个角色 · 点音色更换</span>
       <span class="cast-actions">
         <button class="mini-btn" id="btnReanalyze" title="重新分析全书人名、性别和语气">重新分析</button>
+        <button class="mini-btn" id="btnAiCast" title="用你在设置里配置的大模型解析角色和音色">AI 解析</button>
+        <button class="mini-btn" id="btnMakeVoices" title="为选了“声音设计”且填了描述的角色生成音色">批量音色</button>
         <button class="mini-btn" id="btnAddCast">＋ 角色</button>
       </span>
     </div>
@@ -1129,14 +1310,15 @@ function renderCast() {
         <span class="cast-count">${fp ? `叙述 · 用${book.protagonist}的声音` : '叙述'}</span>
       </div>
       <div class="cast-grid">
-        <select class="cast-voice">${voiceOptions(narrator.voice)}</select>
+        <select class="cast-voice">${voiceOptions(narrator.voice, false)}</select>
         <input class="cast-style" placeholder="语气指令（可留空）" value="${escapeAttr(narrator.style || '')}">
         <button class="mini-btn cast-preview">试听</button>
       </div>
     </div>
     ${rows.map(([name, info]) => {
-      const e = (book.cast || {})[name] || { voice: '苏打', style: '', gender: '?' };
+      const e = castEntryFor(name);
       const g = e.gender || '?';
+      const isDesign = e.voiceMode === 'design';
       return `<div class="cast-row" data-name="${escapeAttr(name)}">
         <div class="cast-top">
           <input class="cast-name" value="${escapeAttr(name)}">
@@ -1144,32 +1326,102 @@ function renderCast() {
           <span class="cast-count">${info.count || 0} 句</span>
         </div>
         <div class="cast-grid">
-          <select class="cast-voice">${voiceOptions(e.voice)}</select>
+          <select class="cast-voice">${voiceOptions(isDesign ? '__design' : e.voice, true)}</select>
           <input class="cast-style" placeholder="语气指令（可留空）" value="${escapeAttr(e.style || '')}">
           <button class="mini-btn cast-preview">试听</button>
         </div>
+        ${isDesign ? `<div class="cast-design">
+          <input class="cast-vdesc" placeholder="音色描述：年龄、性别、音质、语速" value="${escapeAttr(e.voiceDesc || '')}">
+          <div class="row">
+            <button class="mini-btn cast-gen">${e.sampleId ? '重新生成音色' : '生成音色'}</button>
+            <button class="mini-btn cast-sample"${e.sampleId ? '' : ' hidden'}>试听音色</button>
+          </div>
+        </div>` : ''}
       </div>`;
     }).join('')}
-    <p class="cast-note">${fp ? `第一人称：旁白和对白里的“我”都按主角「${escapeAttr(book.protagonist)}」处理。` : ''}性别和语气由全书统计推断，可点 ? 修改；改名字会把同名的话合并。</p>`;
+    <p class="cast-note">${fp ? `第一人称：旁白和对白里的“我”都按主角「${escapeAttr(book.protagonist)}」处理。` : ''}性别和语气由全书统计推断，可点 ? 修改；改名字会把同名的话合并。<br>语气写法：「苍老」「沙哑」「语速缓慢」这类短词会作为风格标签生效，比“老人音”更可靠；长句作为自然语言指令。</p>`;
 
   panel.querySelectorAll('.cast-row').forEach(row => {
     const name = row.dataset.name;
     row.querySelector('.cast-voice').addEventListener('change', (e) => {
       book.cast[name] = book.cast[name] || { voice: '苏打', style: '' };
-      book.cast[name].voice = e.target.value;
+      const v = e.target.value;
+      if (v === '__design') {
+        book.cast[name].voiceMode = 'design';
+        if (!book.cast[name].voiceDesc) {
+          book.cast[name].voiceDesc = defaultVoiceDesc(book.cast[name].gender, book.cast[name].style);
+        }
+        saveBookSoon();
+        renderCast();
+        return;
+      }
+      book.cast[name].voiceMode = 'preset';
+      book.cast[name].voice = v;
       saveBookSoon();
+      clearUrlCache();
     });
-    row.querySelector('.cast-style').addEventListener('change', (e) => {
+    row.querySelector('.cast-style').addEventListener('input', (e) => {
       book.cast[name] = book.cast[name] || { voice: '苏打', style: '' };
       book.cast[name].style = e.target.value.trim();
       saveBookSoon();
     });
-    row.querySelector('.cast-preview').addEventListener('click', () => {
+    row.querySelector('.cast-preview').addEventListener('click', async () => {
       const voice = row.querySelector('.cast-voice').value;
       const style = row.querySelector('.cast-style').value.trim();
       const who = name === '旁白' ? '旁白' : name;
-      previewVoice(`你好，我是${who}。`, voice, style);
+      const entry = book.cast[name];
+      const owner = name === '旁白' && book.firstPerson && book.protagonist && book.protagonist !== '我'
+        ? book.protagonist
+        : name;
+      const pe = (book.cast || {})[owner] || entry;
+      let sample = '';
+      if (pe?.voiceMode === 'design' && pe.sampleId) sample = await getVoiceSample(book.id, owner);
+      previewVoice(`你好，我是${who}。`, pe?.voice || voice, style, sample);
     });
+    const descInput = row.querySelector('.cast-vdesc');
+    if (descInput) {
+      descInput.addEventListener('input', (e) => {
+        book.cast[name].voiceDesc = e.target.value.trim();
+        saveBookSoon();
+      });
+    }
+    const genBtn = row.querySelector('.cast-gen');
+    if (genBtn) {
+      genBtn.addEventListener('click', async () => {
+        const desc = row.querySelector('.cast-vdesc').value.trim();
+        if (!desc) { toast('先写音色描述'); return; }
+        if (!confirm(`为「${name}」生成自定义音色？\n会调用一次 mimo-v2.5-tts-voicedesign（目前限时免费），之后每段用 voiceclone 复用这个音色。`)) return;
+        genBtn.disabled = true;
+        genBtn.textContent = '生成中…';
+        try {
+          const uri = await designVoice(desc);
+          await putVoiceSample(book.id, name, uri, desc);
+          book.cast[name].voiceMode = 'design';
+          book.cast[name].voiceDesc = desc;
+          book.cast[name].sampleId = Date.now();
+          if (book.firstPerson && name === book.protagonist && book.cast['旁白']) {
+            book.cast['旁白'].voice = book.cast[name].voice;
+          }
+          saveBookSoon();
+          renderCast();
+          toast('音色已生成，可点「试听音色」');
+        } catch (err) {
+          genBtn.disabled = false;
+          genBtn.textContent = book.cast[name]?.sampleId ? '重新生成音色' : '生成音色';
+          toast('生成失败：' + (err.message || err), 5000);
+        }
+      });
+    }
+    const sampleBtn = row.querySelector('.cast-sample');
+    if (sampleBtn) {
+      sampleBtn.addEventListener('click', async () => {
+        const uri = await getVoiceSample(book.id, name);
+        if (!uri) { toast('还没有生成音色'); return; }
+        if (previewAudio) previewAudio.pause();
+        previewAudio = new Audio(uri);
+        previewAudio.play().catch(() => toast('播放失败'));
+      });
+    }
     row.querySelector('.cast-name').addEventListener('change', (e) => {
       if (name === '旁白') return;
       const newName = e.target.value.trim();
@@ -1183,15 +1435,27 @@ function renderCast() {
         const next = cur === '?' ? 'F' : cur === 'F' ? 'M' : '?';
         book.cast[name] = book.cast[name] || { voice: '苏打', style: '' };
         book.cast[name].gender = next;
-        const pool = next === 'F' ? ['茉莉', '冰糖'] : next === 'M' ? ['苏打', '白桦'] : ['冰糖', '苏打'];
-        book.cast[name].voice = pool[0];
+        const isDesign = book.cast[name].voiceMode === 'design';
+        if (!isDesign) {
+          const pool = next === 'F' ? ['茉莉', '冰糖'] : next === 'M' ? ['苏打', '白桦'] : ['冰糖', '苏打'];
+          book.cast[name].voice = pool[0];
+        }
         saveBookSoon();
         renderCast();
-        toast(`已标记为${next === '?' ? '未知' : genderLabel(next)}，音色已换成 ${pool[0]}`);
+        toast(next === '?' ? '已标记为未知' : `已标记为${genderLabel(next)}，${isDesign ? '自定义音色保持不变' : '音色已按性别调整'}`);
       });
     }
   });
   $('btnReanalyze').addEventListener('click', reanalyzeBook);
+  $('btnAiCast').addEventListener('click', aiAnalyzeBook);
+  $('btnMakeVoices').addEventListener('click', async () => {
+    const names = Object.entries(book.cast || {})
+      .filter(([n, e]) => n !== '旁白' && e.voiceMode === 'design' && e.voiceDesc && !e.sampleId)
+      .map(([n]) => n);
+    if (!names.length) { toast('先在角色上选「声音设计」并写描述'); return; }
+    if (!confirm(`为 ${names.length} 个角色各生成一次自定义音色？\n模型 mimo-v2.5-tts-voicedesign（目前限时免费），可能会花一些时间。`)) return;
+    await generateVoicesFor(names);
+  });
   $('btnAddCast').addEventListener('click', () => {
     const name = prompt('角色名（和对白里的名字一致）');
     if (!name || !name.trim()) return;
@@ -1315,6 +1579,10 @@ function renderSettings() {
   $('baseUrl').value = s.baseUrl || DEFAULT_BASE;
   $('singleVoice').checked = !!s.singleVoice;
   $('keepAwake').checked = !!s.keepAwake;
+  const ai = loadAi();
+  $('aiBaseUrl').value = ai.baseUrl || '';
+  $('aiKey').value = ai.key || '';
+  $('aiModel').value = ai.model || '';
   updateCacheInfo();
 }
 
@@ -1329,10 +1597,10 @@ async function updateCacheInfo() {
   } catch {}
 }
 
-async function previewVoice(text, voice, style) {
+async function previewVoice(text, voice, style, sample) {
   toast('合成中…', 6000);
   try {
-    const blob = await requestTTS(text, voice, style);
+    const blob = await requestTTS(text, voice, style, undefined, sample);
     if (previewAudio) { previewAudio.pause(); }
     previewAudio = new Audio(URL.createObjectURL(blob));
     previewAudio.play();
@@ -1340,6 +1608,402 @@ async function previewVoice(text, voice, style) {
   } catch (e) {
     toast('试听失败：' + (e.message || e));
   }
+}
+
+/* ---------------- AI 角色解析 ---------------- */
+const AI_CHUNK_CHARS = 30000;
+const AI_VOICES = ['冰糖', '茉莉', '苏打', '白桦'];
+const AI_F_VOICES = ['冰糖', '茉莉'];
+const AI_M_VOICES = ['苏打', '白桦'];
+const AI_SYS = `你是中文小说角色分析助手。阅读给出的原文片段，找出其中有名字或固定外号、并且真正出场的角色（忽略路人和一次性称谓）。
+对每个角色输出：
+- name：最常用的正式称呼（2-6个字，不要带“姑娘/师兄”等称谓）
+- aliases：本段中出现的其他叫法、简称、外号（数组，最多3个，没有则为空数组）
+- gender：F（女）、M（男）或 ?（无法判断），依据“她/他”、身份称谓、亲属关系判断
+- voice：从 冰糖(清亮女声)、茉莉(温柔女声)、苏打(清朗男声)、白桦(低沉男声) 中选一个最贴合的
+- voiceDesc：20-40字的音色描述，写清年龄、性别、音质、语速，用于生成自定义音色，例如“六十多岁的老年男性，嗓音沙哑低沉，语速缓慢”；不要写台词
+- tone：不超过12个字的语气指令，概括这个角色说话的一贯风格
+同时判断：firstPerson（本段是否第一人称叙述）、protagonist（第一人称主角的名字；不是第一人称则填本段最主要角色的名字）。
+只输出 JSON，不要解释，格式：
+{"characters":[{"name":"","aliases":[],"gender":"F","voice":"茉莉","voiceDesc":"","tone":""}],"firstPerson":true,"protagonist":""}`;
+let aiAbort = null;
+let aiPreview = null;
+let aiCancelled = false;
+
+async function aiChat(messages, { json = false, signal } = {}) {
+  const cfg = loadAi();
+  const key = (cfg.key || '').trim();
+  const model = (cfg.model || '').trim();
+  const base = (cfg.baseUrl || '').trim().replace(/\/+$/, '');
+  if (!base || !key || !model) throw new Error('请先在设置里填写 AI 接口地址、Key 和模型');
+  const body = { model, messages, temperature: 0.2 };
+  if (json) body.response_format = { type: 'json_object' };
+  const send = () => fetch(base + '/chat/completions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + key, 'api-key': key },
+    body: JSON.stringify(body),
+    signal,
+  });
+  let res;
+  try {
+    res = await send();
+    if (!res.ok && json && (res.status === 400 || res.status === 422)) {
+      delete body.response_format;
+      res = await send();
+    }
+  } catch (e) {
+    if (e.name === 'AbortError') throw e;
+    throw new Error('连接失败：可能是网络问题，或服务商不允许浏览器直连（CORS）');
+  }
+  if (!res.ok) {
+    let msg = `HTTP ${res.status}`;
+    try { const j = await res.json(); msg = j?.error?.message || j?.message || msg; } catch {}
+    throw new Error(String(msg).slice(0, 180));
+  }
+  const data = await res.json();
+  const content = data?.choices?.[0]?.message?.content;
+  if (typeof content !== 'string' || !content.trim()) throw new Error('模型没有返回内容');
+  return content;
+}
+
+function aiChunks(b) {
+  const out = [];
+  let buf = '';
+  for (const c of b.chapters) {
+    let piece = `【${c.title}】\n${c.content}`;
+    if (piece.length > AI_CHUNK_CHARS * 1.5) {
+      if (buf) { out.push(buf); buf = ''; }
+      while (piece.length > AI_CHUNK_CHARS) {
+        let cut = piece.lastIndexOf('\n', AI_CHUNK_CHARS);
+        if (cut < AI_CHUNK_CHARS * 0.5) cut = AI_CHUNK_CHARS;
+        out.push(piece.slice(0, cut));
+        piece = piece.slice(cut);
+      }
+      buf = piece;
+      continue;
+    }
+    if (buf && buf.length + piece.length > AI_CHUNK_CHARS) { out.push(buf); buf = ''; }
+    buf += (buf ? '\n\n' : '') + piece;
+  }
+  if (buf) out.push(buf);
+  return out;
+}
+
+function aiCleanName(v) {
+  return String(v || '').trim().replace(/[“”"「」『』\s·:：]/g, '').slice(0, 6);
+}
+function aiValidName(n) {
+  return n.length >= 2 && !/^[我你他她它咱]/.test(n) && !NAME_STOP.has(n);
+}
+function aiMentionCount(text, names) {
+  let n = 0;
+  for (const line of text.split('\n')) {
+    if (!line.includes('“') && !line.includes('「')) continue;
+    if (names.some((x) => line.includes(x))) n++;
+  }
+  return Math.max(1, n);
+}
+function aiTop(map) {
+  let best = '', bn = 0;
+  for (const [k, n] of map) {
+    if (n > bn || (n === bn && k.length > best.length)) { best = k; bn = n; }
+  }
+  return best;
+}
+function parseAiJson(text) {
+  const s = String(text).trim().replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();
+  try { return JSON.parse(s); } catch {}
+  const a = s.indexOf('{'), b = s.lastIndexOf('}');
+  if (a >= 0 && b > a) { try { return JSON.parse(s.slice(a, b + 1)); } catch {} }
+  return null;
+}
+
+function aiMergeChunk(acc, j) {
+  const list = Array.isArray(j?.characters) ? j.characters : [];
+  for (const c of list) {
+    const name = aiCleanName(c?.name);
+    if (!aiValidName(name)) continue;
+    let e = acc.get(name);
+    if (!e) {
+      e = { name, aliases: new Set(), f: 0, m: 0, unknown: 0, tones: new Map(), voices: new Map(), descs: new Map(), hits: 0 };
+      acc.set(name, e);
+    }
+    e.hits++;
+    const g = String(c.gender || '').toUpperCase();
+    if (g === 'F') e.f++;
+    else if (g === 'M') e.m++;
+    else e.unknown++;
+    for (const a of (Array.isArray(c.aliases) ? c.aliases : [])) {
+      const t = aiCleanName(a);
+      if (aiValidName(t) && t !== name) e.aliases.add(t);
+    }
+    const tone = String(c.tone || '').trim().slice(0, 16);
+    if (tone) e.tones.set(tone, (e.tones.get(tone) || 0) + 1);
+    const v = String(c.voice || '').trim();
+    if (AI_VOICES.includes(v)) e.voices.set(v, (e.voices.get(v) || 0) + 1);
+    const desc = String(c.voiceDesc || '').replace(/\s+/g, ' ').trim().slice(0, 60);
+    if (desc) e.descs.set(desc, (e.descs.get(desc) || 0) + 1);
+  }
+  return list.length;
+}
+
+function aiResolve(acc) {
+  const parent = new Map();
+  for (const k of acc.keys()) parent.set(k, k);
+  const find = (x) => {
+    while (parent.get(x) !== x) { parent.set(x, parent.get(parent.get(x))); x = parent.get(x); }
+    return x;
+  };
+  for (const e of acc.values()) {
+    for (const a of e.aliases) {
+      if (!acc.has(a)) continue;
+      const ra = find(a), rb = find(e.name);
+      if (ra !== rb) parent.set(ra, rb);
+    }
+  }
+  const groups = new Map();
+  for (const e of acc.values()) {
+    const r = find(e.name);
+    let g = groups.get(r);
+    if (!g) {
+      g = { aliases: new Set(), f: 0, m: 0, unknown: 0, tones: new Map(), voices: new Map(), descs: new Map(), hits: 0, members: [] };
+      groups.set(r, g);
+    }
+    g.members.push({ name: e.name, hits: e.hits });
+    g.f += e.f; g.m += e.m; g.unknown += e.unknown; g.hits += e.hits;
+    for (const a of e.aliases) g.aliases.add(a);
+    for (const [t, n] of e.tones) g.tones.set(t, (g.tones.get(t) || 0) + n);
+    for (const [v, n] of e.voices) g.voices.set(v, (g.voices.get(v) || 0) + n);
+    for (const [d, n] of e.descs) g.descs.set(d, (g.descs.get(d) || 0) + n);
+  }
+  const out = [];
+  for (const g of groups.values()) {
+    let canon = g.members[0];
+    for (const m of g.members) if (m.hits > canon.hits || (m.hits === canon.hits && m.name.length > canon.name.length)) canon = m;
+    const aliases = new Set(g.aliases);
+    for (const m of g.members) if (m.name !== canon.name) aliases.add(m.name);
+    aliases.delete(canon.name);
+    const gender = g.f === g.m ? '?' : (g.f > g.m ? 'F' : 'M');
+    out.push({
+      name: canon.name,
+      aliases: [...aliases].slice(0, 8),
+      gender,
+      tone: aiTop(g.tones),
+      voice: aiTop(g.voices),
+      voiceDesc: aiTop(g.descs),
+      hits: g.hits,
+    });
+  }
+  return out.sort((a, b) => b.hits - a.hits);
+}
+
+function aiPickVoice(gender, voice, current) {
+  let v = AI_VOICES.includes(voice) ? voice : '';
+  if (gender === 'F' && AI_M_VOICES.includes(v)) v = '';
+  if (gender === 'M' && AI_F_VOICES.includes(v)) v = '';
+  if (!v && current && AI_VOICES.includes(current) && !(gender === 'F' && AI_M_VOICES.includes(current)) && !(gender === 'M' && AI_F_VOICES.includes(current))) v = current;
+  if (!v) v = gender === 'F' ? '茉莉' : gender === 'M' ? '苏打' : '冰糖';
+  return v;
+}
+
+function openAi(title, bodyHtml, applyLabel) {
+  $('aiTitle').textContent = title;
+  $('aiBody').innerHTML = bodyHtml;
+  $('aiOverlay').hidden = false;
+  $('aiApply').hidden = !applyLabel;
+  if (applyLabel) $('aiApply').textContent = applyLabel;
+  $('aiCancel').textContent = applyLabel ? '取消' : '停止';
+}
+function closeAi() {
+  if (aiAbort) { aiCancelled = true; aiAbort.abort(); aiAbort = null; }
+  $('aiOverlay').hidden = true;
+  $('aiBody').innerHTML = '';
+  $('aiApply').hidden = true;
+  aiPreview = null;
+}
+
+function aiShowPreview(rawResults, meta, errors, totalChunks) {
+  const known = new Set((book.detected || []).map((d) => d.name));
+  const aliasMap = book.aliases || {};
+  for (const r of rawResults) {
+    if (known.has(r.name) || (book.cast || {})[r.name]) continue;
+    const hit = r.aliases.find((a) => known.has(a) || aliasMap[a] || (book.cast || {})[a]);
+    const target = hit ? (aliasMap[hit] || hit) : '';
+    if (target && target !== r.name) {
+      r.aliases = r.aliases.filter((a) => a !== target);
+      r.aliases.push(r.name);
+      r.name = target;
+    }
+  }
+  const byName = new Map();
+  for (const r of rawResults) {
+    const p = byName.get(r.name);
+    if (!p) { byName.set(r.name, r); continue; }
+    p.aliases = [...new Set([...p.aliases, ...r.aliases])];
+    p.hits += r.hits;
+    if (p.gender === '?' && r.gender !== '?') p.gender = r.gender;
+    if (!p.tone) p.tone = r.tone;
+    if (!p.voice) p.voice = r.voice;
+    if (!p.voiceDesc) p.voiceDesc = r.voiceDesc;
+  }
+  const results = [...byName.values()];
+  for (const r of results) {
+    r.tone = (r.tone || defaultTone(r.gender)).slice(0, 16);
+    r.voice = aiPickVoice(r.gender, r.voice, ((book.cast || {})[r.name] || {}).voice);
+    r.voiceDesc = (r.voiceDesc || ((book.cast || {})[r.name] || {}).voiceDesc || '').slice(0, 60);
+    r.isNew = !known.has(r.name) && !(book.cast || {})[r.name];
+  }
+  results.sort((a, b) => (a.isNew ? 1 : 0) - (b.isNew ? 1 : 0) || b.hits - a.hits);
+  aiPreview = { results, meta };
+  const rows = results.map((r, i) => {
+    const cur = (book.cast || {})[r.name] || {};
+    const g = r.gender || '?';
+    return `<label class="ai-row">
+      <input type="checkbox" data-i="${i}" checked>
+      <div class="ai-main">
+        <div class="ai-name">${escapeAttr(r.name)}<span class="ai-badge${r.isNew ? ' new' : ''}">${r.isNew ? '新增' : '已有'}</span><span class="gchip g-${g}">${genderLabel(g)}</span></div>
+        ${r.aliases.length ? `<div class="ai-alias">别名：${escapeAttr(r.aliases.join('、'))}</div>` : ''}
+        ${r.voiceDesc ? `<div class="ai-desc">音色描述：${escapeAttr(r.voiceDesc)}</div>` : ''}
+        <div class="ai-meta">音色 ${escapeAttr(r.voice)} · 语气 ${escapeAttr(r.tone)}${cur.style && cur.style !== r.tone ? ` · 当前语气 ${escapeAttr(cur.style)}` : ''}</div>
+      </div>
+    </label>`;
+  }).join('');
+  const failed = errors.filter((e) => /^第 \d+ 段/.test(e)).length;
+  const metaLine = `${results.length} 个角色 · ${results.filter((r) => r.isNew).length} 个新增 · ${totalChunks - failed}/${totalChunks} 段成功` +
+    (meta.firstPerson ? ` · 第一人称${meta.protagonist ? `（主角 ${escapeAttr(meta.protagonist)}）` : ''}` : '');
+  const errLine = errors.length ? `<div class="ai-err">${errors.slice(0, 4).map((e) => escapeAttr(e)).join('<br>')}</div>` : '';
+  openAi('AI 解析结果', `<div class="ai-sum">${metaLine}</div>${rows}${errLine}`, '应用所选');
+}
+
+async function aiApplySelection() {
+  if (!aiPreview) return;
+  const picked = [...document.querySelectorAll('#aiBody input[type=checkbox]')]
+    .filter((x) => x.checked)
+    .map((x) => aiPreview.results[+x.dataset.i])
+    .filter(Boolean);
+  const { meta } = aiPreview;
+  const allText = book.chapters.map((c) => c.content).join('\n');
+  book.cast = book.cast || {};
+  book.aliases = book.aliases || {};
+  book.detected = book.detected || [];
+  for (const r of picked) {
+    for (const a of r.aliases) if (aiValidName(a) && a !== r.name) book.aliases[a] = r.name;
+    let d = book.detected.find((x) => x.name === r.name) || book.detected.find((x) => book.aliases[x.name] === r.name);
+    if (!d) {
+      d = { name: r.name, count: aiMentionCount(allText, [r.name, ...r.aliases]), gender: r.gender, tone: r.tone };
+      book.detected.push(d);
+    } else {
+      if (r.gender !== '?') d.gender = r.gender;
+      if (r.tone) d.tone = r.tone;
+    }
+    book.cast[r.name] = Object.assign({ voice: r.voice, style: r.tone, gender: r.gender }, book.cast[r.name], { voice: r.voice, style: r.tone, gender: r.gender });
+    if (r.voiceDesc) book.cast[r.name].voiceDesc = r.voiceDesc;
+    for (const a of r.aliases) if (book.cast[a]) book.aliases[a] = r.name;
+  }
+  if (meta && meta.firstPerson && meta.protagonist && meta.protagonist !== '我') {
+    book.firstPerson = true;
+    book.protagonist = meta.protagonist;
+    book.aliases['我'] = meta.protagonist;
+    const pr = picked.find((x) => x.name === meta.protagonist);
+    let d = book.detected.find((x) => x.name === meta.protagonist);
+    if (!d) {
+      d = {
+        name: meta.protagonist,
+        count: aiMentionCount(allText, [meta.protagonist]),
+        gender: pr ? pr.gender : '?',
+        tone: pr ? pr.tone : defaultTone('?'),
+      };
+      book.detected.push(d);
+    }
+    if (!book.cast[meta.protagonist]) {
+      book.cast[meta.protagonist] = { voice: aiPickVoice(d.gender, '', ''), style: d.tone || defaultTone(d.gender), gender: d.gender };
+    }
+    book.cast['旁白'] = book.cast['旁白'] || { voice: '冰糖', style: NARRATOR_STYLE, gender: '?' };
+    book.cast['旁白'].voice = book.cast[meta.protagonist].voice;
+  }
+  closeAi();
+  chapterToken++;
+  stopPlayback();
+  clearUrlCache();
+  if (book.chapters[chapterIdx]) chapterSegments = buildSegments(book.chapters[chapterIdx].content);
+  currentSeg = -1;
+  saveBookSoon();
+  renderCast();
+  renderChapters();
+  renderPlayer();
+  updatePlayerBar();
+  toast(`已应用 ${picked.length} 个角色`);
+  const withDesc = picked.filter((r) => r.voiceDesc);
+  const need = withDesc.filter((r) => !(book.cast[r.name] || {}).sampleId);
+  if (need.length && confirm(`已写入 ${withDesc.length} 个角色的音色描述，其中 ${need.length} 个还没有自定义音色。\n现在用声音设计生成？每位 1 次请求（目前限时免费）。也可以之后在角色页逐个生成。`)) {
+    for (const r of need) book.cast[r.name].voiceMode = 'design';
+    saveBookSoon();
+    await generateVoicesFor(need.map((r) => r.name));
+  }
+}
+
+async function aiAnalyzeBook() {
+  if (!book) return;
+  const cfg = loadAi();
+  if (!cfg.baseUrl || !cfg.key || !cfg.model) {
+    toast('先在设置里填写 AI 接口、Key 和模型');
+    showView('settings');
+    return;
+  }
+  aiCancelled = false;
+  const chunks = aiChunks(book);
+  if (!chunks.length) { toast('没有可分析的正文'); return; }
+  const total = chunks.reduce((n, c) => n + c.length, 0);
+  const est = Math.round(total / 1.6);
+  if (!confirm(`AI 解析将分 ${chunks.length} 段发送全书：约 ${(total / 10000).toFixed(1)} 万字，输入约 ${(est / 10000).toFixed(1)} 万 tokens。\n\n会按你的模型价格产生费用，确认继续？`)) return;
+
+  const acc = new Map();
+  const errors = [];
+  const pVotes = new Map();
+  let fpSeen = 0, fpYes = 0;
+  aiAbort = new AbortController();
+  openAi('AI 解析中…', `<div class="ai-sum" id="aiProgText">准备中…</div><div class="ai-progress"><i id="aiProgBar"></i></div><div class="ai-sum">可点“停止”中断；已发出的请求仍会计费。</div>`);
+  const t0 = Date.now();
+  for (let i = 0; i < chunks.length; i++) {
+    if (aiAbort && aiAbort.signal.aborted) break;
+    const txt = $('aiProgText');
+    if (txt) txt.textContent = `第 ${i + 1}/${chunks.length} 段 · ${(chunks[i].length / 10000).toFixed(1)} 万字`;
+    const bar = $('aiProgBar');
+    if (bar) bar.style.width = `${Math.round((i / chunks.length) * 100)}%`;
+    try {
+      const raw = await aiChat([
+        { role: 'system', content: AI_SYS },
+        { role: 'user', content: chunks[i] },
+      ], { json: true, signal: aiAbort ? aiAbort.signal : undefined });
+      const j = parseAiJson(raw);
+      if (!j) { errors.push(`第 ${i + 1} 段：返回不是 JSON`); continue; }
+      aiMergeChunk(acc, j);
+      if (typeof j.firstPerson === 'boolean') fpSeen++;
+      if (j.firstPerson === true) {
+        fpYes++;
+        const p = aiCleanName(j.protagonist);
+        if (aiValidName(p)) pVotes.set(p, (pVotes.get(p) || 0) + 1);
+      }
+    } catch (e) {
+      if (e.name === 'AbortError') break;
+      errors.push(`第 ${i + 1} 段：${e.message || e}`);
+      if (errors.filter((x) => /^第 \d+ 段/.test(x)).length > chunks.length * 0.6) break;
+    }
+  }
+  aiAbort = null;
+  if (aiCancelled) return;
+  if (!acc.size) {
+    openAi('AI 解析失败', `<div class="ai-sum">没有拿到可用的角色。</div>${errors.length ? `<div class="ai-err">${errors.slice(0, 5).map((e) => escapeAttr(e)).join('<br>')}</div>` : ''}`);
+    return;
+  }
+  const results = aiResolve(acc);
+  const meta = {
+    firstPerson: fpSeen ? fpYes * 2 >= fpSeen : !!book.firstPerson,
+    protagonist: aiTop(pVotes) || book.protagonist || '',
+  };
+  if (meta.protagonist === '我') meta.protagonist = '';
+  aiShowPreview(results, meta, errors, chunks.length);
+  toast(`AI 解析完成 · ${Math.round((Date.now() - t0) / 1000)} 秒`);
 }
 
 /* ---------------- 事件绑定 ---------------- */
@@ -1422,6 +2086,39 @@ function bind() {
       $('btnTest').textContent = '测试合成';
     }
   });
+
+  $('btnSaveAi').addEventListener('click', () => {
+    saveAi({
+      baseUrl: $('aiBaseUrl').value.trim().replace(/\/+$/, ''),
+      key: $('aiKey').value.trim(),
+      model: $('aiModel').value.trim(),
+    });
+    toast('AI 配置已保存');
+  });
+
+  $('btnAiTest').addEventListener('click', async () => {
+    saveAi({
+      baseUrl: $('aiBaseUrl').value.trim().replace(/\/+$/, ''),
+      key: $('aiKey').value.trim(),
+      model: $('aiModel').value.trim(),
+    });
+    const btn = $('btnAiTest');
+    btn.textContent = '测试中…';
+    btn.disabled = true;
+    try {
+      const out = await aiChat([{ role: 'user', content: '只回复两个字母：OK' }], {});
+      toast('连接成功：' + String(out).trim().slice(0, 20), 4000);
+    } catch (e) {
+      toast('连接失败：' + (e.message || e), 6000);
+    } finally {
+      btn.textContent = '连接测试';
+      btn.disabled = false;
+    }
+  });
+
+  $('aiClose').addEventListener('click', closeAi);
+  $('aiCancel').addEventListener('click', closeAi);
+  $('aiApply').addEventListener('click', aiApplySelection);
 
   $('btnClearCache').addEventListener('click', async () => {
     if (!confirm('清空所有已合成的音频缓存？（书籍和进度保留）')) return;
