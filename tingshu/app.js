@@ -3,7 +3,7 @@
 const DEFAULT_BASE = 'https://api.xiaomimimo.com/v1';
 const AI_DEFAULT_BASE = 'https://api.deepseek.com/v1';
 const AI_DEFAULT_MODEL = 'deepseek-chat';
-const APP_VER = 'v10';
+const APP_VER = 'v12';
 const VOICES = [
   { id: '冰糖', label: '冰糖 · 中文女声' },
   { id: '茉莉', label: '茉莉 · 中文女声' },
@@ -1394,15 +1394,19 @@ function openChapter(i, goPlayer) {
 }
 
 function castList() {
+  const aiUsed = (book.ai?.analyzedTo ?? -1) >= 0;
+  const visible = (e) => !!e && (e.ai === true || e.manual === true || !!e.voiceDesc || !!(e.stages && e.stages.length));
   const map = new Map();
   for (const d of book.detected || []) {
     const name = canonical(d.name);
+    if (aiUsed && !visible(book.cast?.[name])) continue;
     if (!map.has(name)) map.set(name, { count: 0, raw: new Set() });
     const v = map.get(name);
     v.count += d.count;
     v.raw.add(d.name);
   }
   for (const name of Object.keys(book.cast || {})) {
+    if (aiUsed && !visible(book.cast[name])) continue;
     if (!map.has(name)) map.set(name, { count: 0, raw: new Set([name]) });
   }
   map.delete('旁白');
@@ -1460,7 +1464,10 @@ function normalizeEntryStages(e) {
 }
 function retagAll() {
   let n = 0;
-  for (const [name, e] of Object.entries(book?.cast || {})) {
+  const names = new Set(castList().map(([name]) => name));
+  names.add('旁白');
+  for (const name of names) {
+    const e = book?.cast?.[name];
     if (!e) continue;
     if (e.stages && e.stages.length > 1) {
       for (const st of e.stages) {
@@ -1611,12 +1618,13 @@ function renderCast() {
         ${stageHtml}
       </div>`;
     }).join('')}
-        <p class="cast-note">${fp ? `第一人称：旁白和对白里的“我”都按主角「${escapeAttr(book.protagonist)}」处理。` : ''}性别和语气由全书统计推断，可点 ? 修改；改名字会把同名的话合并。AI 解析按批推进（每批约 ${(AI_WINDOW_CHARS / 10000).toFixed(0)} 万字），会按章记录角色的年龄阶段；同一时期只保留一套标签，不会因为描述措辞不同反复换声。听到离本批结尾约 ${(AI_NUDGE_CHARS / 10000).toFixed(0)} 万字时会提醒继续解析。<br>「音色描述」会原样作为角色卡片发给模型，年龄写在这里最稳；改动后该角色的音频会重新合成。播放时用基础模型实时合成，标签直接控制音色和语气，不再生成或复刻样本：标签留空会按音色描述自动推导；短词如「沙哑」「苍老」「语速缓慢」比长句更稳定，最多 6 个，用空格分隔。</p>`;
+        <p class="cast-note">${fp ? `第一人称：旁白和对白里的“我”都按主角「${escapeAttr(book.protagonist)}」处理。` : ''}性别和语气由全书统计推断，可点 ? 修改；改名字会把同名的话合并。AI 解析按批推进（每批约 ${(AI_WINDOW_CHARS / 10000).toFixed(0)} 万字），会按章记录角色的年龄阶段；同一时期只保留一套标签，不会因为描述措辞不同反复换声。听到离本批结尾约 ${(AI_NUDGE_CHARS / 10000).toFixed(0)} 万字时会提醒继续解析。开始 AI 解析后，这里只显示已解析章节里确认出场的角色；后面还没出场的角色，会在继续解析时自动加入。<br>「音色描述」会原样作为角色卡片发给模型，年龄写在这里最稳；改动后该角色的音频会重新合成。播放时用基础模型实时合成，标签直接控制音色和语气，不再生成或复刻样本：标签留空会按音色描述自动推导；短词如「沙哑」「苍老」「语速缓慢」比长句更稳定，最多 6 个，用空格分隔。</p>`;
 
   panel.querySelectorAll('.cast-row').forEach(row => {
     const name = row.dataset.name;
     row.querySelector('.cast-voice').addEventListener('change', (e) => {
       const entry = castEntryFor(name);
+      entry.manual = true;
       const v = e.target.value;
       entry.voice = v;
       if (entry.stages) for (const st of entry.stages) st.voice = v;
@@ -1625,6 +1633,7 @@ function renderCast() {
     });
     row.querySelector('.cast-style').addEventListener('input', (e) => {
       const entry = castEntryFor(name);
+      entry.manual = true;
       entry.style = e.target.value.trim();
       if (entry.stages) for (const st of entry.stages) st.style = entry.style;
       saveBookSoon();
@@ -1632,7 +1641,9 @@ function renderCast() {
     const descInput = row.querySelector('.cast-desc-main');
     if (descInput) {
       descInput.addEventListener('input', (e) => {
-        castEntryFor(name).voiceDesc = e.target.value.trim();
+        const entry = castEntryFor(name);
+        entry.manual = true;
+        entry.voiceDesc = e.target.value.trim();
         saveBookSoon();
       });
       descInput.addEventListener('change', () => clearUrlCache());
@@ -1640,7 +1651,9 @@ function renderCast() {
     const tagsInput = row.querySelector('.cast-tags-main');
     if (tagsInput) {
       tagsInput.addEventListener('input', (e) => {
-        castEntryFor(name).tags = e.target.value.trim();
+        const entry = castEntryFor(name);
+        entry.manual = true;
+        entry.tags = e.target.value.trim();
         saveBookSoon();
       });
       tagsInput.addEventListener('change', () => clearUrlCache());
@@ -1674,12 +1687,14 @@ function renderCast() {
       stDesc.addEventListener('input', (ev) => {
         st.desc = ev.target.value.trim();
         if (si === 0) book.cast[name].voiceDesc = st.desc;
+        book.cast[name].manual = true;
         saveBookSoon();
       });
       stDesc.addEventListener('change', () => clearUrlCache());
       const stTags = sr.querySelector('.stage-tags');
       stTags.addEventListener('input', (ev) => {
         st.tags = ev.target.value.trim();
+        book.cast[name].manual = true;
         saveBookSoon();
       });
       stTags.addEventListener('change', () => clearUrlCache());
@@ -1701,6 +1716,7 @@ function renderCast() {
         const next = cur === '?' ? 'F' : cur === 'F' ? 'M' : '?';
         book.cast[name] = book.cast[name] || { voice: '苏打', style: '' };
         book.cast[name].gender = next;
+        book.cast[name].manual = true;
         const pool = next === 'F' ? ['茉莉', '冰糖'] : next === 'M' ? ['苏打', '白桦'] : ['冰糖', '苏打'];
         book.cast[name].voice = pool[0];
         if (book.cast[name].stages) for (const st of book.cast[name].stages) st.voice = pool[0];
@@ -1720,7 +1736,7 @@ function renderCast() {
     const name = prompt('角色名（和对白里的名字一致）');
     if (!name || !name.trim()) return;
     const n = name.trim();
-    book.cast[n] = { voice: '苏打', style: '', gender: '?' };
+    book.cast[n] = { voice: '苏打', style: '', gender: '?', manual: true };
     saveBookSoon();
     renderCast();
   });
@@ -1729,7 +1745,8 @@ function renderCast() {
 function renameSpeaker(oldName, newName) {
   book.aliases[oldName] = newName;
   if (book.cast[oldName]) { book.cast[newName] = book.cast[oldName]; delete book.cast[oldName]; }
-  if (!book.cast[newName]) book.cast[newName] = { voice: '苏打', style: '' };
+  if (!book.cast[newName]) book.cast[newName] = { voice: '苏打', style: '', manual: true };
+  book.cast[newName].manual = true;
   saveBookSoon();
   chapterToken++;
   stopPlayback();
@@ -1886,16 +1903,89 @@ const AI_SYS = `你是中文小说角色分析助手。阅读给出的原文片�
 - voice：从 冰糖(清亮女声)、茉莉(温柔女声)、苏打(清朗男声)、白桦(低沉男声) 中选一个最贴合的
 - stage：这个角色在本段所处的阶段，只能填 童年/少年/青年/中年/老年/不变 之一（同一角色处于同一时期必须用同一个词；没有明显变化就填“不变”）
 - voiceDesc：20-40字的音色描述，只写本段这个阶段的年龄、性别、音质、语速，例如“八岁男孩，声音清脆，语速偏快”；不要写台词
-- tags：2-5个空格分隔的风格标签，只从这些词里选：磁性/醇厚/清亮/空灵/稚嫩/苍老/甜美/沙哑/醇雅/温柔/高冷/活泼/严肃/慵懒/俏皮/深沉/低沉/干练/凌厉/御姐音/正太音/大叔音/夹子音/台湾腔/东北话/四川话/河南话/粤语，可再加“语速较快/语速缓慢”；不要写台词和剧情
+- tags：2-5个空格分隔的风格标签，只从这些词里选：磁性/醇厚/清亮/空灵/稚嫩/苍老/甜美/沙哑/醇雅/温柔/高冷/活泼/严肃/慵懒/俏皮/深沉/低沉/干练/凌厉/御姐音/正太音/大叔音/夹子音/台湾腔/东北话/四川话/河南话/粤语/语速较快/语速缓慢/语速适中；不要用“温柔/平稳”凑数，没有明显依据就少给
+- tagBasis：给 tags 里的每个标签写依据，JSON 对象，键是标签，值是简短依据，例如 {"沙哑":"原文：他嗓子像破锣","低沉":"推断：三十岁男性将军"}；原文没有直接描写时必须以“推断：”开头
 - tone：不超过12个字的语气指令，概括这个角色本段说话的风格
+贴标签规则：先找原文依据（年龄阶段、身份职业、方言口音、说话方式、旁人评价），再选对应标签；同一角色在同一阶段保持同一套标签，不要逐段换；进入新阶段时按该阶段重贴。原文只写了“青年男子”这类信息时，最多给 1 个标注“推断”的标签。不要贴愤怒/悲伤等情绪标签，情绪由台词决定。
 这是长篇小说的一个片段，人物可能随剧情长大或变老。同一人物在不同片段处于不同年龄/身份阶段时，stage、voiceDesc 和 tags 要如实反映该阶段；处于同一阶段时请保持相同的阶段标签、描述和标签组合，避免重复刷新。
 这里只提供全书的一批章节，请按这一批内容判断角色当时所处的阶段，不要推断更后面的剧情。
 同时判断：firstPerson（本段是否第一人称叙述）、protagonist（第一人称主角的名字；不是第一人称则填本段最主要角色的名字）。
 只输出 JSON，不要解释，格式：
-{"characters":[{"name":"","aliases":[],"gender":"F","voice":"茉莉","stage":"青年","voiceDesc":"","tags":"","tone":""}],"firstPerson":true,"protagonist":""}`;
+{"characters":[{"name":"","aliases":[],"gender":"F","voice":"茉莉","stage":"青年","voiceDesc":"","tags":"","tagBasis":{},"tone":""}],"firstPerson":true,"protagonist":""}`;
 let aiAbort = null;
 let aiPreview = null;
 let aiCancelled = false;
+
+const AI_TAG_FILLERS = new Set(['温柔', '平稳']);
+
+function aiParseTagBasis(raw) {
+  const map = new Map();
+  const put = (k, v) => {
+    const tag = String(k == null ? '' : k).replace(/[()（）[\]【】"'“”]/g, '').trim();
+    const note = String(v == null ? '' : v).replace(/\s+/g, ' ').trim().slice(0, 80);
+    if (KNOWN_TAGS.has(tag) && note) map.set(tag, note);
+  };
+  const parseText = (s) => {
+    for (const part of String(s || '').split(/[;；\n]+/)) {
+      const m = part.match(/^([^=＝:：]{1,10})[=＝:：](.+)$/);
+      if (m) put(m[1], m[2]);
+    }
+  };
+  if (Array.isArray(raw)) {
+    for (const item of raw) {
+      if (item && typeof item === 'object') put(item.tag || item.name, item.basis || item.reason || item.evidence);
+      else parseText(item);
+    }
+  } else if (raw && typeof raw === 'object') {
+    for (const [k, v] of Object.entries(raw)) put(k, v);
+  } else if (typeof raw === 'string') {
+    parseText(raw);
+  }
+  return map;
+}
+
+function aiValidateTags(rawTags, rawBasis, desc, tone, text) {
+  const tags = cleanTagList(rawTags).split(/\s+/).filter((t) => KNOWN_TAGS.has(t));
+  const basis = aiParseTagBasis(rawBasis);
+  const derived = new Set(deriveTags(desc, tone));
+  const out = [];
+  const notes = [];
+  let inferred = 0;
+  for (const tag of tags) {
+    const b = basis.get(tag) || '';
+    let kind = '';
+    if (b) {
+      if (/(推断|推测|默认|未明写|合理|可能)/.test(b)) {
+        kind = '推断';
+      } else {
+        const quote = b.replace(/^原文\s*[:：]?\s*/, '').replace(/[“”"「」『』]/g, '').trim();
+        if (quote && text && text.includes(quote)) kind = '原文';
+        else if (desc && (desc.includes(b) || b.includes(desc))) kind = '描述';
+        else kind = '依据';
+      }
+    } else if (derived.has(tag)) {
+      kind = '描述';
+    }
+    if (!kind) continue;
+    if (AI_TAG_FILLERS.has(tag) && kind !== '原文') continue;
+    if (kind !== '原文' && kind !== '描述') {
+      if (inferred >= 1) continue;
+      inferred++;
+    }
+    if (out.includes(tag)) continue;
+    out.push(tag);
+    notes.push({ tag, basis: b || '音色描述', kind });
+    if (out.length >= 5) break;
+  }
+  if (!out.length) {
+    for (const tag of derived) {
+      out.push(tag);
+      notes.push({ tag, basis: '由音色描述推导', kind: '描述' });
+      if (out.length >= 3) break;
+    }
+  }
+  return { tags: out.slice(0, 5).join(' '), notes };
+}
 
 async function aiChat(messages, { json = false, signal } = {}) {
   const cfg = loadAi();
@@ -2134,6 +2224,7 @@ function aiBuildStages(chunkResults, canonOf) {
         label: String(c.stage || '').trim().slice(0, 8),
         desc: String(c.voiceDesc || '').replace(/\s+/g, ' ').trim().slice(0, 60),
         tags: cleanTagList(c.tags),
+        tagNotes: Array.isArray(c.tagNotes) ? c.tagNotes : [],
         tone: String(c.tone || '').trim().slice(0, 16),
         voice: AI_VOICES.includes(v) ? v : '',
       });
@@ -2146,18 +2237,21 @@ function aiBuildStages(chunkResults, canonOf) {
     for (const r of arr) {
       const prev = stages[stages.length - 1];
       if (!prev) {
-        stages.push({ from: r.from, to: r.to, label: r.label, desc: r.desc, tags: r.tags, tone: r.tone, voice: r.voice });
+        stages.push({ from: r.from, to: r.to, label: r.label, desc: r.desc, tags: r.tags, tagNotes: r.tagNotes, tone: r.tone, voice: r.voice });
         continue;
       }
       const sameLabel = sameStagePeriod(prev.label, r.label);
       const sameDesc = !!(r.desc && prev.desc && r.desc === prev.desc);
       if (r.desc && prev.desc && !sameDesc && !sameLabel) {
-        stages.push({ from: r.from, to: r.to, label: r.label, desc: r.desc, tags: r.tags, tone: r.tone, voice: r.voice });
+        stages.push({ from: r.from, to: r.to, label: r.label, desc: r.desc, tags: r.tags, tagNotes: r.tagNotes, tone: r.tone, voice: r.voice });
         continue;
       }
       prev.to = Math.max(prev.to, r.to);
       if (!prev.desc && r.desc) prev.desc = r.desc;
-      if (!prev.tags && r.tags) prev.tags = r.tags;
+      if (!prev.tags && r.tags) {
+        prev.tags = r.tags;
+        prev.tagNotes = r.tagNotes;
+      }
       if (!prev.label && r.label) prev.label = r.label;
       if (!prev.tone && r.tone) prev.tone = r.tone;
       if (!prev.voice && r.voice) prev.voice = r.voice;
@@ -2168,12 +2262,15 @@ function aiBuildStages(chunkResults, canonOf) {
       const prev = cleaned[cleaned.length - 1];
       if (prev && prev.desc === s.desc) {
         prev.to = Math.max(prev.to, s.to);
-        if (!prev.tags && s.tags) prev.tags = s.tags;
+        if (!prev.tags && s.tags) {
+          prev.tags = s.tags;
+          prev.tagNotes = s.tagNotes;
+        }
         continue;
       }
       cleaned.push(s);
     }
-    if (cleaned.length > 1) out.set(name, cleaned);
+    if (cleaned.length) out.set(name, cleaned);
   }
   return out;
 }
@@ -2201,6 +2298,15 @@ function closeAi() {
   $('aiBody').innerHTML = '';
   $('aiApply').hidden = true;
   aiPreview = null;
+}
+
+function aiTagLine(tags, notes) {
+  const map = new Map((Array.isArray(notes) ? notes : []).map((n) => [n.tag, n]));
+  return String(tags || '').split(/\s+/).filter(Boolean).map((t) => {
+    const n = map.get(t);
+    const mark = !n ? '' : n.kind === '原文' ? '（原文）' : n.kind === '描述' ? '（描述）' : '（推断）';
+    return `<span class="ai-tag" title="${escapeAttr(n ? `依据：${n.basis}` : '')}">${escapeAttr(t)}${mark}</span>`;
+  }).join(' ');
 }
 
 function aiShowPreview(rawResults, meta, errors, totalChunks) {
@@ -2234,9 +2340,21 @@ function aiShowPreview(rawResults, meta, errors, totalChunks) {
     r.tone = (r.tone || defaultTone(r.gender)).slice(0, 16);
     r.voice = aiPickVoice(r.gender, r.voice, ((book.cast || {})[r.name] || {}).voice);
     r.stages = (r.stages || []).filter((s) => s.desc);
+    if (r.stages.length === 1) {
+      const s0 = r.stages[0];
+      if (!r.voiceDesc) r.voiceDesc = s0.desc;
+      if (!r.tags && s0.tags) {
+        r.tags = s0.tags;
+        r.tagNotes = s0.tagNotes;
+      }
+    }
     if (r.stages.length > 1) r.voiceDesc = r.stages[0].desc;
     r.voiceDesc = (r.voiceDesc || ((book.cast || {})[r.name] || {}).voiceDesc || '').slice(0, 60);
     r.tags = cleanTagList(r.tags) || deriveTags(r.voiceDesc, r.tone).join(' ');
+    if (!Array.isArray(r.tagNotes) || !r.tagNotes.length) {
+      const derived = new Set(deriveTags(r.voiceDesc, r.tone));
+      r.tagNotes = r.tags.split(/\s+/).filter((t) => derived.has(t)).map((t) => ({ tag: t, basis: '由音色描述推导', kind: '描述' }));
+    }
     r.isNew = !known.has(r.name) && !(book.cast || {})[r.name];
   }
   results.sort((a, b) => (a.isNew ? 1 : 0) - (b.isNew ? 1 : 0) || b.hits - a.hits);
@@ -2245,7 +2363,7 @@ function aiShowPreview(rawResults, meta, errors, totalChunks) {
     const cur = (book.cast || {})[r.name] || {};
     const g = r.gender || '?';
     const stHtml = r.stages.length > 1
-      ? `<div class="ai-stages">${r.stages.map((s) => `<div class="ai-stage"><span class="ai-stage-range">${aiRangeLabel(s)}</span>${s.label ? `<span class="ai-badge">${escapeAttr(s.label)}</span>` : ''}<span class="ai-stage-desc">${escapeAttr(s.desc)}</span></div>`).join('')}</div>`
+      ? `<div class="ai-stages">${r.stages.map((s) => `<div class="ai-stage"><span class="ai-stage-range">${aiRangeLabel(s)}</span>${s.label ? `<span class="ai-badge">${escapeAttr(s.label)}</span>` : ''}<span class="ai-stage-desc">${escapeAttr(s.desc)}</span></div>${s.tags ? `<div class="ai-stage-tags">标签 ${aiTagLine(s.tags, s.tagNotes)}</div>` : ''}`).join('')}</div>`
       : (r.voiceDesc ? `<div class="ai-desc">音色描述：${escapeAttr(r.voiceDesc)}</div>` : '');
     return `<label class="ai-row">
       <input type="checkbox" data-i="${i}" checked>
@@ -2253,7 +2371,7 @@ function aiShowPreview(rawResults, meta, errors, totalChunks) {
         <div class="ai-name">${escapeAttr(r.name)}<span class="ai-badge${r.isNew ? ' new' : ''}">${r.isNew ? '新增' : '已有'}</span><span class="gchip g-${g}">${genderLabel(g)}</span></div>
         ${r.aliases.length ? `<div class="ai-alias">别名：${escapeAttr(r.aliases.join('、'))}</div>` : ''}
         ${stHtml}
-        <div class="ai-meta">音色 ${escapeAttr(r.voice)} · 语气 ${escapeAttr(r.tone)}${r.tags ? ` · 标签 ${escapeAttr(r.tags)}` : ''}${cur.style && cur.style !== r.tone ? ` · 当前语气 ${escapeAttr(cur.style)}` : ''}</div>
+        <div class="ai-meta">音色 ${escapeAttr(r.voice)} · 语气 ${escapeAttr(r.tone)}${r.tags ? ` · 标签 ${aiTagLine(r.tags, r.tagNotes)}` : ''}${cur.style && cur.style !== r.tone ? ` · 当前语气 ${escapeAttr(cur.style)}` : ''}</div>
       </div>
     </label>`;
   }).join('');
@@ -2357,6 +2475,7 @@ async function aiApplySelection() {
       entry.tags = cleanTagList(r.tags) || deriveTags(entry.voiceDesc, entry.style).join(' ');
     }
     entry.voiceMode = 'tag';
+    entry.ai = true;
     book.cast[r.name] = entry;
     for (const a of r.aliases) if (book.cast[a]) book.aliases[a] = r.name;
   }
@@ -2453,8 +2572,15 @@ async function aiAnalyzeBook() {
       ], { json: true, signal: aiAbort ? aiAbort.signal : undefined });
       const j = parseAiJson(raw);
       if (!j) { errors.push(`第 ${i + 1} 段：返回不是 JSON`); continue; }
+      const list = Array.isArray(j.characters) ? j.characters : [];
+      for (const c of list) {
+        if (!c || typeof c !== 'object') continue;
+        const v = aiValidateTags(c.tags, c.tagBasis, c.voiceDesc, c.tone, chunks[i].text);
+        c.tags = v.tags;
+        c.tagNotes = v.notes;
+      }
       aiMergeChunk(acc, j);
-      chunkResults.push({ from: chunks[i].from, to: chunks[i].to, list: Array.isArray(j.characters) ? j.characters : [] });
+      chunkResults.push({ from: chunks[i].from, to: chunks[i].to, list });
       if (typeof j.firstPerson === 'boolean') fpSeen++;
       if (j.firstPerson === true) {
         fpYes++;
