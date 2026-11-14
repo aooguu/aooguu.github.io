@@ -106,6 +106,12 @@ body.has-player main{padding-bottom:calc(var(--nav-h) + var(--pb-h) + var(--safe
 .cast-grid input:focus,.cast-grid select:focus,.cast-name:focus{outline:none;border-color:var(--accent);color:var(--text)}
 .mini-btn{padding:7px 9px;border-radius:8px;border:1px solid var(--line);color:var(--muted);font-size:12px;white-space:nowrap}
 .mini-btn:active{border-color:var(--accent);color:var(--accent)}
+.clone-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:8px;padding-top:8px;border-top:1px dashed var(--line)}
+.clone-toggle{display:flex;align-items:center;gap:5px;font-size:12px;color:var(--muted);cursor:pointer}
+.clone-toggle input{accent-color:var(--accent)}
+.clone-toggle input:disabled{cursor:not-allowed}
+.clone-info{flex:1;min-width:0;font-size:11px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.clone-del{color:#f0b0b0;border-color:#5a3333}
 .cast-note{margin:10px 2px 0;font-size:12px;color:var(--muted);line-height:1.6}
 .cast-design{margin-top:8px;padding-top:8px;border-top:1px dashed var(--line)}
 .cast-vdesc{display:block;width:100%;background:var(--bg-soft);border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-size:13px}

@@ -3,7 +3,7 @@
 const DEFAULT_BASE = 'https://api.xiaomimimo.com/v1';
 const AI_DEFAULT_BASE = 'https://api.deepseek.com/v1';
 const AI_DEFAULT_MODEL = 'deepseek-chat';
-const APP_VER = 'v13';
+const APP_VER = 'v14';
 const VOICES = [
   { id: '冰糖', label: '冰糖 · 中文女声' },
   { id: '茉莉', label: '茉莉 · 中文女声' },
@@ -163,6 +163,46 @@ async function getEntrySample(bookId, name, entry) {
     if (uri) return uri;
   }
   return '';
+}
+
+const CLONE_MAX_BYTES = 6 * 1024 * 1024;
+const CLONE_MAX_B64 = 9 * 1024 * 1024;
+const cloneSampleMem = new Map();
+const cloneMissingWarned = new Set();
+function cloneKey(bookId, name) {
+  return voiceKey(bookId, name, 'clone');
+}
+async function getCloneSample(bookId, name) {
+  const k = cloneKey(bookId, name);
+  if (cloneSampleMem.has(k)) return cloneSampleMem.get(k);
+  let rec = null;
+  try { rec = await idb.get('voices', k); } catch {}
+  const v = rec?.dataUri ? { dataUri: rec.dataUri, hash: rec.hash || '', fileName: rec.desc || '' } : null;
+  cloneSampleMem.set(k, v);
+  return v;
+}
+async function putCloneSample(bookId, name, dataUri, hash, fileName) {
+  const k = cloneKey(bookId, name);
+  await idb.put('voices', { key: k, bookId, name, dataUri, hash, desc: fileName, createdAt: Date.now() });
+  cloneSampleMem.set(k, { dataUri, hash, fileName });
+}
+async function delCloneSample(bookId, name) {
+  const k = cloneKey(bookId, name);
+  await idb.del('voices', k);
+  cloneSampleMem.delete(k);
+}
+function readFileDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result || ''));
+    r.onerror = () => reject(r.error || new Error('读取失败'));
+    r.readAsDataURL(file);
+  });
+}
+function normalizeAudioDataUri(uri, fileName) {
+  const ext = (String(fileName).split('.').pop() || '').toLowerCase();
+  const mime = ext === 'wav' ? 'audio/wav' : 'audio/mpeg';
+  return String(uri).replace(/^data:[^;,]*/, 'data:' + mime);
 }
 
 /* ---------------- 小工具 ---------------- */
@@ -1002,21 +1042,22 @@ function saveBookSoon() {
 const TTS_CACHE_VER = 5;
 const VOICE_DESIGN_TEXT = '你来了。夜里的风有些凉，先进屋坐坐吧，我给你倒杯热茶。';
 
-async function requestTTS(text, voice, tags, card, signal) {
+async function requestTTS(text, voice, tags, card, signal, cloneUri) {
   const s = loadSettings();
   const apiKey = (s.apiKey || '').trim();
   if (!apiKey) throw new Error('请先在设置里填写 API Key');
   const base = (s.baseUrl || DEFAULT_BASE).replace(/\/+$/, '');
   const tagStr = cleanTagList(tags);
-  const cardText = String(card || '').trim().slice(0, 200);
+  const clone = String(cloneUri || '').trim();
+  const cardText = clone ? '' : String(card || '').trim().slice(0, 200);
   const messages = [];
   if (cardText) messages.push({ role: 'user', content: cardText });
   messages.push({ role: 'assistant', content: (tagStr ? `（${tagStr.replace(/\s+/g, '，')}）` : '') + text });
 
   const body = JSON.stringify({
-    model: 'mimo-v2.5-tts',
+    model: clone ? 'mimo-v2.5-tts-voiceclone' : 'mimo-v2.5-tts',
     messages,
-    audio: { format: 'mp3', voice: voice || '冰糖' },
+    audio: { format: 'mp3', voice: clone || voice || '冰糖' },
   });
   let lastErr = null;
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -1150,13 +1191,15 @@ async function getSegmentAudio(seg) {
   const own = castStageFor(seg.speaker, chapterIdx);
   let entry = own.entry, stage = own.stage;
   const lineTags = cleanLineTags(seg.lineTags);
-  if (seg.speaker === '旁白' && b.firstPerson && b.protagonist && b.protagonist !== '我') {
+  const fpNarrator = seg.speaker === '旁白' && b.firstPerson && b.protagonist && b.protagonist !== '我';
+  if (fpNarrator) {
     const pr = castStageFor(b.protagonist, chapterIdx);
     if (pr.entry) {
       entry = Object.assign({}, entry, pr.entry);
       stage = pr.stage;
     }
   }
+  let cloneUri = '', cloneHash = '';
   if (!s.singleVoice) {
     voice = entry?.voice || (seg.speaker === '旁白' ? '冰糖' : '苏打');
     if (lineTags) {
@@ -1166,14 +1209,26 @@ async function getSegmentAudio(seg) {
       tags = stageTags(stage, entry);
       card = speechCard(entry, stage);
     }
+    if (entry?.clone) {
+      const owner = entry.cloneOwner || (fpNarrator ? b.protagonist : seg.speaker);
+      const cs = await getCloneSample(b.id, owner);
+      if (cs?.dataUri) {
+        cloneUri = cs.dataUri;
+        cloneHash = cs.hash || 'n';
+        card = '';
+      } else if (!cloneMissingWarned.has(owner)) {
+        cloneMissingWarned.add(owner);
+        toast(`「${owner}」的克隆样本不在本机，暂用预设音色`, 4000);
+      }
+    }
   } else if (lineTags) {
     tags = lineTags;
   }
-  const stamp = `${lineTags ? 'l' : 't'}:${voice}:${tags}`;
+  const stamp = cloneUri ? `c:${cloneHash}:${tags}` : `${lineTags ? 'l' : 't'}:${voice}:${tags}`;
   const key = await hashKey([b.id, card, seg.text, stamp, 'v' + TTS_CACHE_VER].join('\u0000'));
   const rec = await idb.get('audio', key);
   if (rec?.blob) return rec.blob;
-  const blob = await requestTTS(seg.text, voice, tags, card);
+  const blob = await requestTTS(seg.text, voice, tags, card, undefined, cloneUri);
   await idb.put('audio', { key, bookId: b.id, blob, size: blob.size, createdAt: Date.now() });
   return blob;
 }
@@ -1465,7 +1520,7 @@ async function openChapter(i, goPlayer) {
 
 function castList() {
   const aiUsed = (book.ai?.analyzedTo ?? -1) >= 0;
-  const visible = (e) => !!e && (e.ai === true || e.manual === true || !!e.voiceDesc || !!(e.stages && e.stages.length));
+  const visible = (e) => !!e && (e.ai === true || e.manual === true || !!e.voiceDesc || !!e.cloneHash || !!(e.stages && e.stages.length));
   const map = new Map();
   for (const d of book.detected || []) {
     const name = canonical(d.name);
@@ -1485,6 +1540,24 @@ function castList() {
 
 function voiceOptions(selected) {
   return VOICES.map(v => `<option value="${v.id}"${v.id === selected ? ' selected' : ''}>${v.label}</option>`).join('');
+}
+
+function fmtSize(n) {
+  const v = Number(n) || 0;
+  return v >= 1048576 ? (v / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(v / 1024)) + ' KB';
+}
+
+function cloneRowHtml(e) {
+  const has = !!(e.cloneHash && e.cloneName);
+  const size = has && e.cloneSize ? ` · ${fmtSize(e.cloneSize)}` : '';
+  return `<div class="clone-row">
+      <label class="clone-toggle"><input type="checkbox" class="clone-use" ${has && e.clone ? 'checked' : ''} ${has ? '' : 'disabled'}> 用克隆音色</label>
+      <button class="mini-btn clone-upload">${has ? '更换样本' : '上传克隆样本'}</button>
+      ${has
+        ? `<span class="clone-info" title="${escapeAttr(e.cloneName)}">${escapeAttr(e.cloneName)}${size}</span><button class="mini-btn clone-del">移除</button>`
+        : '<span class="clone-info">3–20 秒清晰人声，mp3 / wav，≤6 MB</span>'}
+      <input class="clone-file" type="file" accept=".mp3,.wav,audio/mpeg,audio/wav" hidden>
+    </div>`;
 }
 function normalizeEntryStages(e) {
   if (!e || !Array.isArray(e.stages) || e.stages.length < 2) return false;
@@ -1626,7 +1699,7 @@ function reanalyzeBook() {
 function renderCast() {
   const panel = $('castPanel');
   const rows = castList();
-  const narrator = (book.cast || {})['旁白'] || { voice: '冰糖', style: NARRATOR_STYLE };
+  const narrator = castEntryFor('旁白');
   const fp = book.firstPerson && book.protagonist && book.protagonist !== '我';
   const aiTo = book.ai?.analyzedTo ?? -1;
   const win = aiWindow(book);
@@ -1651,6 +1724,9 @@ function renderCast() {
         <input class="cast-style" placeholder="语气指令（可留空）" value="${escapeAttr(narrator.style || '')}">
         <button class="mini-btn cast-preview">试听</button>
       </div>
+      ${fp
+        ? `<div class="clone-row"><span class="clone-info">旁白沿用主角「${escapeAttr(book.protagonist)}」的克隆音色（在主角卡设置）</span></div>`
+        : cloneRowHtml(narrator)}
       ${fp ? '' : `<input class="cast-desc cast-desc-main" placeholder="音色描述（含年龄），如：三十岁女性，声音清亮，语速适中" value="${escapeAttr(narrator.voiceDesc || '')}">`}
       <input class="cast-tags cast-tags-main" placeholder="风格标签，如：平稳 语速适中" value="${escapeAttr(entryTags(narrator))}">
     </div>
@@ -1683,12 +1759,13 @@ function renderCast() {
           <input class="cast-style" placeholder="语气指令（可留空）" value="${escapeAttr(e.style || '')}">
           <button class="mini-btn cast-preview">试听</button>
         </div>
+        ${cloneRowHtml(e)}
         ${staged ? '' : `<input class="cast-desc cast-desc-main" placeholder="音色描述（含年龄），如：四十岁男性，声音低沉沙哑，语速缓慢" value="${escapeAttr(e.voiceDesc || '')}">`}
         ${staged ? '' : `<input class="cast-tags cast-tags-main" placeholder="风格标签，如：磁性 低沉 语速缓慢" title="${escapeAttr(e.voiceDesc || '')}" value="${escapeAttr(entryTags(e))}">`}
         ${stageHtml}
       </div>`;
     }).join('')}
-        <p class="cast-note">${fp ? `第一人称：旁白和对白里的“我”都按主角「${escapeAttr(book.protagonist)}」处理。` : ''}性别和语气由全书统计推断，可点 ? 修改；改名字会把同名的话合并。AI 解析按批推进（每批约 ${(AI_WINDOW_CHARS / 10000).toFixed(0)} 万字），会按章记录角色的年龄阶段；同一时期只保留一套标签，不会因为描述措辞不同反复换声。听到离本批结尾约 ${(AI_NUDGE_CHARS / 10000).toFixed(0)} 万字时会提醒继续解析。开始 AI 解析后，这里只显示已解析章节里确认出场的角色；后面还没出场的角色，会在继续解析时自动加入。<br>「音色描述」会原样作为角色卡片发给模型，年龄写在这里最稳；改动后该角色的音频会重新合成。播放时用基础模型实时合成，标签直接控制音色和语气，不再生成或复刻样本：标签留空会按音色描述自动推导；短词如「沙哑」「苍老」「语速缓慢」比长句更稳定，最多 6 个，用空格分隔。</p>`;
+        <p class="cast-note">${fp ? `第一人称：旁白和对白里的“我”都按主角「${escapeAttr(book.protagonist)}」处理。` : ''}性别和语气由全书统计推断，可点 ? 修改；改名字会把同名的话合并。AI 解析按批推进（每批约 ${(AI_WINDOW_CHARS / 10000).toFixed(0)} 万字），会按章记录角色的年龄阶段；同一时期只保留一套标签，不会因为描述措辞不同反复换声。听到离本批结尾约 ${(AI_NUDGE_CHARS / 10000).toFixed(0)} 万字时会提醒继续解析。开始 AI 解析后，这里只显示已解析章节里确认出场的角色；后面还没出场的角色，会在继续解析时自动加入。<br>「音色描述」会原样作为角色卡片发给模型，年龄写在这里最稳；改动后该角色的音频会重新合成。播放时默认用基础模型实时合成，标签直接控制音色和语气；勾选「用克隆音色」的角色会改用克隆模型，每段随请求发送一次样本，逐句 AI 语气标签照常生效。标签留空会按音色描述自动推导；短词如「沙哑」「苍老」「语速缓慢」比长句更稳定，最多 6 个，用空格分隔。</p>`;
 
   panel.querySelectorAll('.cast-row').forEach(row => {
     const name = row.dataset.name;
@@ -1747,8 +1824,74 @@ function renderCast() {
         tags = entryTags(pe);
         card = speechCard(pe, null);
       }
-      previewVoice(`你好，我是${who}。`, voice, tags, card);
+      let cloneUri = '';
+      if (pe?.clone) {
+        const cs = await getCloneSample(book.id, pe.cloneOwner || owner);
+        if (cs?.dataUri) { cloneUri = cs.dataUri; card = ''; }
+      }
+      previewVoice(`你好，我是${who}。`, voice, tags, card, cloneUri);
     });
+    const cloneUse = row.querySelector('.clone-use');
+    if (cloneUse) {
+      cloneUse.addEventListener('change', () => {
+        const entry = castEntryFor(name);
+        entry.manual = true;
+        entry.clone = cloneUse.checked;
+        saveBookSoon();
+        clearUrlCache();
+        toast(cloneUse.checked ? '已启用克隆音色' : '已改用预设音色');
+      });
+    }
+    const cloneUpload = row.querySelector('.clone-upload');
+    if (cloneUpload) {
+      const fileInput = row.querySelector('.clone-file');
+      cloneUpload.addEventListener('click', () => fileInput.click());
+      fileInput.addEventListener('change', async () => {
+        const f = fileInput.files && fileInput.files[0];
+        fileInput.value = '';
+        if (!f) return;
+        const ext = (f.name.split('.').pop() || '').toLowerCase();
+        if (ext !== 'mp3' && ext !== 'wav') { toast('请上传 mp3 或 wav 格式的样本'); return; }
+        if (f.size > CLONE_MAX_BYTES) { toast('样本太大，请裁剪到 3–20 秒（≤6 MB）'); return; }
+        try {
+          const dataUri = normalizeAudioDataUri(await readFileDataUrl(f), f.name);
+          if (dataUri.length > CLONE_MAX_B64) { toast('样本太大，请裁剪到 3–20 秒'); return; }
+          const hash = (await hashKey(dataUri)).slice(0, 16);
+          await putCloneSample(book.id, name, dataUri, hash, f.name);
+          const entry = castEntryFor(name);
+          entry.manual = true;
+          entry.clone = true;
+          entry.cloneOwner = name;
+          entry.cloneHash = hash;
+          entry.cloneName = f.name;
+          entry.cloneSize = f.size;
+          saveBookSoon();
+          clearUrlCache();
+          renderCast();
+          toast(`已启用「${name}」的克隆音色`);
+        } catch (err) {
+          toast('读取样本失败：' + (err.message || err));
+        }
+      });
+    }
+    const cloneDel = row.querySelector('.clone-del');
+    if (cloneDel) {
+      cloneDel.addEventListener('click', async () => {
+        if (!confirm(`移除「${name}」的克隆样本？`)) return;
+        const entry = castEntryFor(name);
+        await delCloneSample(book.id, entry.cloneOwner || name);
+        entry.manual = true;
+        delete entry.clone;
+        delete entry.cloneOwner;
+        delete entry.cloneHash;
+        delete entry.cloneName;
+        delete entry.cloneSize;
+        saveBookSoon();
+        clearUrlCache();
+        renderCast();
+        toast('已移除克隆样本，恢复预设音色');
+      });
+    }
     row.querySelectorAll('.stage-row').forEach((sr) => {
       const si = +sr.dataset.si;
       const st = book.cast[name]?.stages?.[si];
@@ -1768,9 +1911,15 @@ function renderCast() {
         saveBookSoon();
       });
       stTags.addEventListener('change', () => clearUrlCache());
-      sr.querySelector('.stage-preview').addEventListener('click', () => {
+      sr.querySelector('.stage-preview').addEventListener('click', async () => {
         const voice = st.voice || book.cast[name]?.voice || '苏打';
-        previewVoice(`你好，我是${name}。`, voice, stageTags(st, book.cast[name]), speechCard(book.cast[name], st));
+        let card = speechCard(book.cast[name], st);
+        let cloneUri = '';
+        if (book.cast[name]?.clone) {
+          const cs = await getCloneSample(book.id, book.cast[name].cloneOwner || name);
+          if (cs?.dataUri) { cloneUri = cs.dataUri; card = ''; }
+        }
+        previewVoice(`你好，我是${name}。`, voice, stageTags(st, book.cast[name]), card, cloneUri);
       });
     });
     row.querySelector('.cast-name').addEventListener('change', (e) => {
@@ -1949,10 +2098,10 @@ async function updateCacheInfo() {
   } catch {}
 }
 
-async function previewVoice(text, voice, tags, card) {
+async function previewVoice(text, voice, tags, card, cloneUri) {
   toast('合成中…', 6000);
   try {
-    const blob = await requestTTS(text, voice, tags, card);
+    const blob = await requestTTS(text, voice, tags, card, undefined, cloneUri);
     if (previewAudio) { previewAudio.pause(); }
     previewAudio = new Audio(URL.createObjectURL(blob));
     previewAudio.play();
