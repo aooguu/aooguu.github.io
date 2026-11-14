@@ -3,7 +3,7 @@
 const DEFAULT_BASE = 'https://api.xiaomimimo.com/v1';
 const AI_DEFAULT_BASE = 'https://api.deepseek.com/v1';
 const AI_DEFAULT_MODEL = 'deepseek-chat';
-const APP_VER = 'v20';
+const APP_VER = 'v21';
 const VOICES = [
   { id: '冰糖', label: '冰糖 · 中文女声' },
   { id: '茉莉', label: '茉莉 · 中文女声' },
@@ -1414,12 +1414,14 @@ document.addEventListener('visibilitychange', () => {
 /* ---------------- 视图 ---------------- */
 function showView(name) {
   currentView = name;
+  document.body.classList.toggle('chat-mode', name === 'chat');
   if (name !== 'chat') chatCancelRecording();
   for (const [k, el] of Object.entries({ shelf: $('view-shelf'), book: $('view-book'), player: $('view-player'), chat: $('view-chat'), settings: $('view-settings') })) {
     el.hidden = k !== name;
   }
   document.querySelectorAll('#tabbar .tab').forEach(b => b.classList.toggle('active', b.dataset.nav === name));
   const inThread = name === 'chat' && chat && !$('chatThread').hidden;
+  document.body.classList.toggle('chat-thread', !!inThread);
   $('chatDock').hidden = !inThread;
   if (!inThread) $('stickerPanel').hidden = true;
   $('topTitle').textContent = name === 'settings' ? '设置'
@@ -3554,6 +3556,9 @@ let chatSaveTimer = 0;
 let chatRecording = null;
 let chatVoiceDraft = null;
 let chatModalApplyFn = null;
+let chatVoiceMode = false;
+let chatHoldActive = false;
+let chatRecTimer = 0;
 
 function chatSaveSoon() {
   if (!chat) return;
@@ -3570,7 +3575,7 @@ function chatMembersAll() {
 function chatSpeakerColor(name) {
   let h = 0;
   for (const ch of String(name || '')) h = (h * 31 + ch.charCodeAt(0)) % 360;
-  return `hsl(${h} 55% 72%)`;
+  return `hsl(${h} 42% 56%)`;
 }
 
 async function loadChatStickers() {
@@ -3676,11 +3681,31 @@ function renderChatMessages() {
     box.appendChild(d);
     return;
   }
-  let prev = '';
+  let lastAt = 0;
   for (const m of chat.messages) {
-    box.appendChild(chatMsgEl(m, m.speaker !== prev));
-    prev = m.speaker || '';
+    if (m.at && (!lastAt || m.at - lastAt > 5 * 60 * 1000)) box.appendChild(chatTimeEl(m.at));
+    box.appendChild(chatMsgEl(m, true));
+    lastAt = m.at || lastAt;
   }
+}
+
+function chatTimeLabel(at) {
+  const d = new Date(at);
+  const now = new Date();
+  const hm = d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
+  const sameDay = d.toDateString() === now.toDateString();
+  const y = new Date(now);
+  y.setDate(now.getDate() - 1);
+  if (sameDay) return hm;
+  if (d.toDateString() === y.toDateString()) return `昨天 ${hm}`;
+  return `${d.getMonth() + 1}月${d.getDate()}日 ${hm}`;
+}
+
+function chatTimeEl(at) {
+  const d = document.createElement('div');
+  d.className = 'chat-time';
+  d.textContent = chatTimeLabel(at);
+  return d;
 }
 
 function chatMsgEl(m, showName) {
@@ -3700,7 +3725,8 @@ function chatMsgEl(m, showName) {
   if (m.role === 'user') av.textContent = '我';
   else {
     av.textContent = String(m.speaker || '?').slice(0, 1);
-    av.style.color = chatSpeakerColor(m.speaker);
+    av.style.background = chatSpeakerColor(m.speaker);
+    av.style.color = '#fff';
   }
   const body = document.createElement('div');
   body.className = 'cmsg-body';
@@ -3724,8 +3750,10 @@ function chatMsgEl(m, showName) {
   } else if (m.type === 'uservoice' || m.type === 'voice') {
     const v = document.createElement('div');
     v.className = 'cvoice';
-    v.innerHTML = '<span>🔊</span><span class="cwave">▁▂▃▂▁</span><span class="cdur"></span>';
-    v.querySelector('.cdur').textContent = m.dur ? `${Math.round(m.dur)}″` : '';
+    const secs = Math.max(1, Math.round(m.dur || 1));
+    v.style.width = Math.min(220, 70 + secs * 6) + 'px';
+    v.innerHTML = '<span class="cplay">🔊</span><span class="cwave">▁▂▃▂▁</span><span class="cdur"></span>';
+    v.querySelector('.cdur').textContent = m.dur ? `${secs}″` : '';
     v.addEventListener('click', (e) => { e.stopPropagation(); chatPlayVoiceMsg(m, v); });
     bubble.appendChild(v);
     if (m.text) {
@@ -3753,12 +3781,14 @@ function chatMsgEl(m, showName) {
 
 function chatPush(msg) {
   if (!chat) return null;
+  const prevAt = chat.messages[chat.messages.length - 1]?.at || 0;
   const m = Object.assign({ id: uid(), at: Date.now() }, msg);
   chat.messages.push(m);
   chat.updatedAt = Date.now();
   const box = $('chatMsgs');
   box.querySelector('.cmsg.placeholder')?.remove();
   const near = window.innerHeight + window.scrollY >= document.body.scrollHeight - 200;
+  if (!prevAt || m.at - prevAt > 5 * 60 * 1000) box.appendChild(chatTimeEl(m.at));
   box.appendChild(chatMsgEl(m, true));
   chatSaveSoon();
   if (near) window.scrollTo(0, document.body.scrollHeight);
@@ -4014,13 +4044,32 @@ function chatSendSticker(name) {
   chatAskAi();
 }
 
-async function chatToggleRecord() {
-  const btn = $('btnChatMic');
-  if (!chat) return;
-  if (chatRecording) {
-    try { chatRecording.rec.stop(); } catch {}
-    return;
+function setChatVoiceMode(on) {
+  chatVoiceMode = !!on;
+  const mic = $('btnChatMic');
+  mic.textContent = chatVoiceMode ? '⌨' : '🎙';
+  mic.title = chatVoiceMode ? '切换键盘' : '语音';
+  mic.classList.toggle('on', chatVoiceMode);
+  $('chatInput').hidden = chatVoiceMode;
+  $('btnChatHold').hidden = !chatVoiceMode;
+  $('btnChatSend').hidden = chatVoiceMode;
+  if (chatVoiceMode) {
+    $('chatInput').blur();
+    $('stickerPanel').hidden = true;
+    $('btnChatSticker').classList.remove('on');
+  } else {
+    $('chatInput').focus();
   }
+}
+
+function chatResetRecUi() {
+  clearInterval(chatRecTimer);
+  const hold = $('btnChatHold');
+  if (hold) { hold.classList.remove('rec'); hold.textContent = '按住 说话'; }
+}
+
+async function chatStartRecording() {
+  if (!chat || chatRecording) return;
   if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
     toast('这个浏览器不支持录音', 3000);
     return;
@@ -4032,35 +4081,46 @@ async function chatToggleRecord() {
     toast('没有麦克风权限', 3000);
     return;
   }
+  const hold = $('btnChatHold');
   const rec = new MediaRecorder(stream);
   const chunks = [];
   const startedAt = Date.now();
+  const item = { rec, stream, startedAt };
   rec.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
-  rec.onstop = async () => {
+  rec.onstop = () => {
     stream.getTracks().forEach((t) => t.stop());
-    chatRecording = null;
-    btn.classList.remove('rec');
-    btn.textContent = '🎙';
+    if (chatRecording === item) chatRecording = null;
+    chatHoldActive = false;
+    chatResetRecUi();
     const dur = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
     const blob = new Blob(chunks, { type: rec.mimeType || 'audio/webm' });
     if (blob.size < 800) { toast('录音太短', 2000); return; }
     openVoiceDraft(blob, dur);
   };
-  chatRecording = { rec, stream };
+  chatRecording = item;
   rec.start();
-  btn.classList.add('rec');
-  btn.textContent = '■';
-  toast('正在录音，再点一次结束', 2500);
+  hold.classList.add('rec');
+  hold.textContent = '松开 结束';
+  chatRecTimer = setInterval(() => {
+    if (!chatRecording) return;
+    const s = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
+    hold.textContent = `松开 结束 ${s}″`;
+  }, 500);
+  if (!chatHoldActive) { try { rec.stop(); } catch {} }
+}
+
+function chatStopRecording() {
+  if (chatRecording) { try { chatRecording.rec.stop(); } catch {} }
 }
 
 function chatCancelRecording() {
-  if (!chatRecording) return;
+  if (!chatRecording) { chatResetRecUi(); return; }
   const { rec, stream } = chatRecording;
   chatRecording = null;
+  chatHoldActive = false;
   try { rec.onstop = null; rec.stop(); } catch {}
   try { stream.getTracks().forEach((t) => t.stop()); } catch {}
-  const btn = $('btnChatMic');
-  if (btn) { btn.classList.remove('rec'); btn.textContent = '🎙'; }
+  chatResetRecUi();
 }
 
 function openVoiceDraft(blob, dur) {
@@ -4309,7 +4369,25 @@ function bindChat() {
   $('btnChatBack').addEventListener('click', () => { renderChatLobby(); window.scrollTo(0, 0); });
   $('btnChatSettings').addEventListener('click', openChatSettings);
   $('btnChatSend').addEventListener('click', chatSendText);
-  $('btnChatMic').addEventListener('click', chatToggleRecord);
+  $('btnChatMic').addEventListener('click', () => setChatVoiceMode(!chatVoiceMode));
+
+  const hold = $('btnChatHold');
+  hold.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    if (!chat || chatHoldActive) return;
+    chatHoldActive = true;
+    try { hold.setPointerCapture(e.pointerId); } catch {}
+    chatStartRecording();
+  });
+  const endHold = (e) => {
+    if (!chatHoldActive) return;
+    e.preventDefault();
+    chatHoldActive = false;
+    chatStopRecording();
+  };
+  hold.addEventListener('pointerup', endHold);
+  hold.addEventListener('pointercancel', endHold);
+  hold.addEventListener('contextmenu', (e) => e.preventDefault());
 
   const input = $('chatInput');
   const grow = () => {

@@ -1,4 +1,4 @@
-const CACHE = 'tingshu-v20';
+const CACHE = 'tingshu-v21';
 const ASSETS = [
   './',
   './index.html',
