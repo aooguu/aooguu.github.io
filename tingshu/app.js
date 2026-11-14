@@ -3,7 +3,7 @@
 const DEFAULT_BASE = 'https://api.xiaomimimo.com/v1';
 const AI_DEFAULT_BASE = 'https://api.deepseek.com/v1';
 const AI_DEFAULT_MODEL = 'deepseek-chat';
-const APP_VER = 'v14';
+const APP_VER = 'v17';
 const VOICES = [
   { id: '冰糖', label: '冰糖 · 中文女声' },
   { id: '茉莉', label: '茉莉 · 中文女声' },
@@ -52,7 +52,7 @@ function saveAi(patch) {
 let db = null;
 function openDB() {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open('tingshu', 3);
+    const req = indexedDB.open('tingshu', 4);
     req.onupgradeneeded = () => {
       const d = req.result;
       if (!d.objectStoreNames.contains('books')) d.createObjectStore('books', { keyPath: 'id' });
@@ -67,6 +67,15 @@ function openDB() {
       if (!d.objectStoreNames.contains('scripts')) {
         const sc = d.createObjectStore('scripts', { keyPath: 'key' });
         sc.createIndex('bookId', 'bookId');
+      }
+      if (!d.objectStoreNames.contains('chats')) {
+        const c = d.createObjectStore('chats', { keyPath: 'id' });
+        c.createIndex('bookId', 'bookId');
+      }
+      if (!d.objectStoreNames.contains('stickers')) d.createObjectStore('stickers', { keyPath: 'id' });
+      if (!d.objectStoreNames.contains('chatMedia')) {
+        const m = d.createObjectStore('chatMedia', { keyPath: 'id' });
+        m.createIndex('chatId', 'chatId');
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -896,6 +905,9 @@ let previewAudio = null;
 let wakeLock = null;
 let exporting = false;
 let exportAbort = false;
+let segTouchStart = null;
+let segTouchMoved = false;
+let segClickBlockedUntil = 0;
 
 function canonical(name) {
   let n = name;
@@ -908,7 +920,7 @@ function canonical(name) {
   return n;
 }
 
-function buildSegments(text) {
+function buildSegments(text, ci) {
   const known = new Set(book.detected ? book.detected.map(d => d.name) : []);
   for (const k of Object.keys(book.cast || {})) known.add(k);
   if (book.firstPerson && book.protagonist) known.add(book.protagonist);
@@ -941,7 +953,32 @@ function buildSegments(text) {
       if (tail.trim()) push('旁白', tail);
     }
   }
+  applySpeakerFixes(segs, ci);
   return segs;
+}
+
+function applySpeakerFixes(segs, ci) {
+  if (!book || !Number.isInteger(ci)) return;
+  const fixes = book.speakerFixes?.[ci];
+  if (!Array.isArray(fixes) || !fixes.length) return;
+  for (const f of fixes) {
+    const i = Number(f.i);
+    const name = String(f.speaker || '').trim();
+    if (!Number.isInteger(i) || i < 0 || i >= segs.length || !name) continue;
+    let hit = segs[i];
+    if (!hit || (f.text && hit.text !== f.text)) {
+      hit = null;
+      for (let d = 1; d <= 3 && !hit; d++) {
+        const a = segs[i - d], b = segs[i + d];
+        if (a && a.text === f.text) hit = a;
+        else if (b && b.text === f.text) hit = b;
+      }
+    }
+    if (!hit) continue;
+    hit.speaker = canonical(name);
+    hit.speakerFixed = true;
+    hit.fixBasis = f.basis || '';
+  }
 }
 
 async function loadChapterScript() {
@@ -1201,7 +1238,9 @@ async function getSegmentAudio(seg) {
   }
   let cloneUri = '', cloneHash = '';
   if (!s.singleVoice) {
-    voice = entry?.voice || (seg.speaker === '旁白' ? '冰糖' : '苏打');
+    voice = isGenderVoice(seg.speaker)
+      ? (seg.speaker === '女声' ? '茉莉' : '苏打')
+      : (entry?.voice || (seg.speaker === '旁白' ? '冰糖' : '苏打'));
     if (lineTags) {
       tags = lineTags;
       card = identityCard(entry, stage);
@@ -1389,11 +1428,17 @@ document.addEventListener('visibilitychange', () => {
 /* ---------------- 视图 ---------------- */
 function showView(name) {
   currentView = name;
-  for (const [k, el] of Object.entries({ shelf: $('view-shelf'), book: $('view-book'), player: $('view-player'), settings: $('view-settings') })) {
+  if (name !== 'chat') chatCancelRecording();
+  for (const [k, el] of Object.entries({ shelf: $('view-shelf'), book: $('view-book'), player: $('view-player'), chat: $('view-chat'), settings: $('view-settings') })) {
     el.hidden = k !== name;
   }
   document.querySelectorAll('#tabbar .tab').forEach(b => b.classList.toggle('active', b.dataset.nav === name));
-  $('topTitle').textContent = name === 'settings' ? '设置' : (book && name !== 'shelf' ? book.title : 'TXT 听书');
+  const inThread = name === 'chat' && chat && !$('chatThread').hidden;
+  $('chatDock').hidden = !inThread;
+  if (!inThread) $('stickerPanel').hidden = true;
+  $('topTitle').textContent = name === 'settings' ? '设置'
+    : name === 'chat' ? (inThread ? chat.name : '群聊')
+      : (book && name !== 'shelf' ? book.title : 'TXT 听书');
   window.scrollTo(0, 0);
 }
 
@@ -1444,6 +1489,11 @@ async function openBook(id) {
   if (!b.cast) b.cast = defaultCast(b);
   if (!b.aliases) b.aliases = {};
   book = b;
+  chat = null;
+  chatReplyToken++;
+  $('chatDock').hidden = true;
+  $('stickerPanel').hidden = true;
+  document.body.classList.remove('chat-thread');
   let fixed = false;
   for (const d of b.detected || []) {
     const e = b.cast[d.name];
@@ -1462,7 +1512,7 @@ async function openBook(id) {
   if (fixed) idb.put('books', b).catch(() => {});
   const p = loadProgress(b.id) || { chapter: 0, segment: 0 };
   chapterIdx = Math.min(p.chapter || 0, b.chapters.length - 1);
-  chapterSegments = buildSegments(b.chapters[chapterIdx].content);
+  chapterSegments = buildSegments(b.chapters[chapterIdx].content, chapterIdx);
   await loadChapterScript();
   currentSeg = -1;
   playing = false;
@@ -1501,12 +1551,20 @@ function renderChapters() {
 }
 
 async function openChapter(i, goPlayer) {
+  const keepPlayingChapter = goPlayer && i === chapterIdx && (playing || currentSeg >= 0 || !!audioEl.src);
+  if (keepPlayingChapter) {
+    showView('player');
+    renderSegHighlight();
+    updatePlayerBar();
+    return;
+  }
+  const wasPlaying = playing;
   chapterIdx = i;
   chapterToken++;
   clearUrlCache();
   stopPlayback();
   audioEl.removeAttribute('src');
-  chapterSegments = buildSegments(book.chapters[i].content);
+  chapterSegments = buildSegments(book.chapters[i].content, i);
   await loadChapterScript();
   currentSeg = -1;
   saveProgress();
@@ -1514,8 +1572,13 @@ async function openChapter(i, goPlayer) {
   renderPlayer();
   updatePlayerBar();
   aiNudgeCheck();
-  if (goPlayer && chapterSegments.length) prefetch(0);
-  if (goPlayer) showView('player');
+  if (goPlayer) {
+    showView('player');
+    if (chapterSegments.length) {
+      if (wasPlaying) playIndex(0);
+      else prefetch(0);
+    }
+  }
 }
 
 function castList() {
@@ -1686,7 +1749,7 @@ function reanalyzeBook() {
   chapterToken++;
   stopPlayback();
   clearUrlCache();
-  chapterSegments = buildSegments(book.chapters[chapterIdx].content);
+  chapterSegments = buildSegments(book.chapters[chapterIdx].content, chapterIdx);
   currentSeg = -1;
   saveBookSoon();
   renderCast();
@@ -1970,12 +2033,97 @@ function renameSpeaker(oldName, newName) {
   chapterToken++;
   stopPlayback();
   clearUrlCache();
-  chapterSegments = buildSegments(book.chapters[chapterIdx].content);
+  chapterSegments = buildSegments(book.chapters[chapterIdx].content, chapterIdx);
   currentSeg = -1;
   renderCast();
   renderPlayer();
   updatePlayerBar();
   toast('已改名');
+}
+
+function normalizeSpeakerName(v) {
+  return String(v || '').replace(/[“”"「」『』\s·:：]/g, '').trim().slice(0, 12);
+}
+
+function ensureSpeakerCast(name, gender) {
+  if (!book) return '';
+  const cname = canonical(name);
+  if (isGenderVoice(cname)) return cname;
+  book.cast = book.cast || {};
+  book.detected = book.detected || [];
+  let entry = book.cast[cname];
+  if (!entry) {
+    entry = {
+      voice: gender === 'F' ? '茉莉' : gender === 'M' ? '苏打' : '冰糖',
+      style: '',
+      gender: gender === 'F' || gender === 'M' ? gender : '?',
+      manual: true,
+    };
+    book.cast[cname] = entry;
+  } else {
+    if ((!entry.gender || entry.gender === '?') && (gender === 'F' || gender === 'M')) entry.gender = gender;
+    entry.manual = true;
+  }
+  if (!book.detected.some((d) => canonical(d.name) === cname)) {
+    const all = book.chapters.map((c) => c.content).join('\n');
+    book.detected.push({
+      name: cname,
+      count: Math.max(1, all.split(cname).length - 1),
+      gender: entry.gender || '?',
+      tone: entry.style || '',
+    });
+  }
+  return cname;
+}
+
+function upsertSpeakerFix(ci, i, text, speaker, basis, confidence) {
+  if (!book) return;
+  book.speakerFixes = book.speakerFixes || {};
+  const list = Array.isArray(book.speakerFixes[ci]) ? book.speakerFixes[ci] : [];
+  const entry = {
+    i,
+    text,
+    speaker: canonical(speaker),
+    basis: basis || '',
+    confidence: confidence || '',
+  };
+  const at = list.findIndex((x) => Number(x.i) === i);
+  if (at >= 0) list[at] = entry;
+  else list.push(entry);
+  book.speakerFixes[ci] = list;
+}
+
+function refreshAfterSpeakerFix() {
+  if (!book) return;
+  const keep = currentSeg;
+  chapterToken++;
+  stopPlayback();
+  try { audioEl.removeAttribute('src'); } catch {}
+  clearUrlCache();
+  chapterSegments = buildSegments(book.chapters[chapterIdx].content, chapterIdx);
+  for (const [i, line] of chapterScriptLines) {
+    const seg = chapterSegments[i];
+    if (seg && seg.text === line.text) seg.lineTags = line.tags;
+  }
+  currentSeg = keep >= 0 ? Math.min(keep, chapterSegments.length - 1) : -1;
+  saveBookSoon();
+  renderCast();
+  renderPlayer();
+  updatePlayerBar();
+}
+
+function assignSpeakerManually(i) {
+  const seg = chapterSegments[i];
+  if (!seg || seg.speaker !== '未知角色') return;
+  const names = [...new Set(['旁白', ...castList().map(([name]) => name)])];
+  const input = prompt(`第 ${i + 1} 句未知角色\n\n可选：${names.join('、')}\n\n输入说话人（新名字会自动新增角色）：`, '');
+  if (input == null) return;
+  const name = normalizeSpeakerName(input);
+  if (name.length < 2) { toast('名字至少 2 个字'); return; }
+  ensureSpeakerCast(name);
+  upsertSpeakerFix(chapterIdx, i, seg.text, name, '手动指定', 'manual');
+  refreshAfterSpeakerFix();
+  toast(`已指定为「${name}」`);
 }
 
 function escapeAttr(s) {
@@ -1985,10 +2133,13 @@ function escapeAttr(s) {
 /* ---------------- 播放页 ---------------- */
 function renderPlayer() {
   if (!book) return;
-  const scriptLabel = chapterScriptLines.size ? `AI 语气 ${chapterScriptLines.size}` : 'AI 语气';
-  $('nowChapter').innerHTML = `<span id="nowChapterTitle"></span><button class="mini-btn" id="btnScript" title="用 AI 给本章每句标语气，不改原文">${scriptLabel}</button><button class="mini-btn" id="btnExport">导出本章 MP3</button>`;
+  const scriptN = chapterScriptLines.size;
+  const unknownCount = chapterSegments.filter((s) => s.speaker === '未知角色').length;
+  const fillBits = [scriptN ? `语气 ${scriptN}` : '语气', unknownCount ? `未知 ${unknownCount}` : '未知'];
+  const fillLabel = `AI 补全 · ${fillBits.join(' · ')}`;
+  $('nowChapter').innerHTML = `<span id="nowChapterTitle"></span><button class="mini-btn" id="btnAiFill" title="一次跑完：给本章标语气 + 推断未知说话人，不改原文">${fillLabel}</button><button class="mini-btn" id="btnExport">导出本章 MP3</button>`;
   $('nowChapterTitle').textContent = book.chapters[chapterIdx].title;
-  $('btnScript').addEventListener('click', aiAnnotateChapter);
+  $('btnAiFill').addEventListener('click', aiFillChapter);
   $('btnExport').addEventListener('click', exportChapter);
 
   const list = $('segList');
@@ -2002,24 +2153,46 @@ function renderPlayer() {
     const el = document.createElement('div');
     el.className = 'seg-item';
     el.dataset.i = i;
-    const cls = seg.speaker === '旁白' ? 'narrator' : (seg.speaker === '未知角色' ? 'unknown' : '');
+    const cls = seg.speaker === '旁白' ? 'narrator' : (seg.speaker === '未知角色' ? 'unknown' : (isGenderVoice(seg.speaker) ? 'gender' : ''));
     const lineTags = cleanLineTags(seg.lineTags);
     el.innerHTML = `<div class="seg-meta"><span class="chip ${cls}"></span><span class="seg-idx">${i + 1}</span></div><div class="seg-text"></div>${lineTags ? '<div class="seg-tags"></div>' : ''}`;
-    el.querySelector('.chip').textContent = seg.speaker;
+    const chip = el.querySelector('.chip');
+    chip.textContent = seg.speaker;
+    if (seg.speaker === '未知角色') chip.title = '点击指定说话人';
+    else if (isGenderVoice(seg.speaker)) chip.title = '没查到名字，按性别使用占位音色';
+    else if (seg.speakerFixed) chip.title = seg.fixBasis ? `已修正：${seg.fixBasis}` : '已修正';
     el.querySelector('.seg-text').textContent = seg.text;
     if (lineTags) el.querySelector('.seg-tags').textContent = lineTags;
-    el.addEventListener('click', () => { showView('player'); playIndex(i); });
     frag.appendChild(el);
   });
   list.appendChild(frag);
   renderSegHighlight();
 }
 
+function scrollSegIntoView(el) {
+  if (!el) return;
+  const vh = window.visualViewport ? window.visualViewport.height : window.innerHeight;
+  const topbar = $('topbar');
+  const top = (topbar ? topbar.getBoundingClientRect().bottom : 0) + 10;
+  const pb = $('playerBar');
+  const tab = $('tabbar');
+  const overlays = (pb && !pb.hidden ? pb.getBoundingClientRect().height : 0)
+    + (tab ? tab.getBoundingClientRect().height : 0);
+  const bottom = vh - overlays - 12;
+  const rect = el.getBoundingClientRect();
+  if (rect.top >= top && rect.bottom <= bottom) return;
+  const lane = Math.max(80, bottom - top);
+  const target = window.scrollY + rect.top - top - Math.min(140, lane * 0.18);
+  window.scrollTo({ top: Math.max(0, target), behavior: 'smooth' });
+}
+
 function renderSegHighlight() {
   const list = $('segList');
   list.querySelectorAll('.seg-item').forEach(el => el.classList.toggle('current', Number(el.dataset.i) === currentSeg));
+  if (currentSeg < 0 || currentView !== 'player') return;
+  if (segTouchStart || Date.now() < segClickBlockedUntil) return;
   const cur = list.querySelector('.seg-item.current');
-  if (cur) cur.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  if (cur) scrollSegIntoView(cur);
 }
 
 function updatePlayerBar() {
@@ -2137,7 +2310,7 @@ const AI_SYS = `你是中文小说角色分析助手。阅读给出的原文片�
 {"characters":[{"name":"","aliases":[],"gender":"F","voice":"茉莉","stage":"青年","voiceDesc":"","tags":"","tagBasis":{},"tone":""}],"firstPerson":true,"protagonist":""}`;
 let aiAbort = null;
 let aiPreview = null;
-let aiScriptPreview = null;
+let aiCombinedPreview = null;
 let aiCancelled = false;
 
 const AI_SCRIPT_SYS = `你是中文小说配音导演。下面给出按顺序切好的旁白和对白段落，请给需要表演提示的句子标上 1-3 个简短中文语气标签。
@@ -2148,6 +2321,23 @@ const AI_SCRIPT_SYS = `你是中文小说配音导演。下面给出按顺序切
 - 不要输出“无/正常/自然/普通”这类空标签；不要贴音色，音色由角色卡决定。
 - 只标注“lines”里的段落；“before”只是上文参考，不要输出。
 只输出 JSON，格式：{"lines":[{"i":0,"tags":"愤怒 提高音量"}]}`;
+
+const AI_UNKNOWN_LOOKAHEAD = 3000;
+const GENDER_VOICE_NAMES = ['男声', '女声'];
+function isGenderVoice(name) {
+  return GENDER_VOICE_NAMES.includes(name);
+}
+const AI_UNKNOWN_SYS = `你是中文小说配音导演。下面给出某一章的段落（segs）、已知角色（known）和本章之后的原文（later，最多约 3000 字）。其中 speaker 为“未知角色”的段落，是原文没有明确交代说话人的对白。
+请根据上下文、对话轮次、称呼、动作归属，以及 later 中后续剧情揭示的身份，为这些段落推断说话人。
+要求：
+- 优先使用 known 里已有的名字。
+- 只有在 later 明确揭示了新名字时才使用新名字；名字必须是原文或 later 中真实出现的称呼（2-6字），不得编造。
+- 只处理 speaker 为“未知角色”的段落，不要改旁白，也不要把旁白身份当成说话人。
+- 同一段连续对话通常由同一人所说，可结合前后句判断；注意对话轮次和称呼对象。
+- 如果上下文和 later 都没有出现名字：不要猜名字，speaker 填“男声”或“女声”，按语气、称呼、动作判断性别，confidence 填 low。连性别都判断不了才填空字符串。
+- confidence 只能是 high/medium/low。high 仅用于原文或后文有明确依据的情况。
+- basis 用一句短话说明依据，尽量引用后文或原文的关键词。
+只输出 JSON，格式：{"unknowns":[{"i":0,"speaker":"","confidence":"high","basis":""}]}`;
 
 const AI_TAG_FILLERS = new Set(['温柔', '平稳']);
 
@@ -2220,13 +2410,13 @@ function aiValidateTags(rawTags, rawBasis, desc, tone, text) {
   return { tags: out.slice(0, 5).join(' '), notes };
 }
 
-async function aiChat(messages, { json = false, signal } = {}) {
+async function aiChat(messages, { json = false, signal, temperature } = {}) {
   const cfg = loadAi();
   const key = (cfg.key || '').trim();
   const model = (cfg.model || '').trim();
   const base = (cfg.baseUrl || '').trim().replace(/\/+$/, '');
   if (!base || !key || !model) throw new Error('请先在设置里填写 AI API Key');
-  const body = { model, messages, temperature: 0.2 };
+  const body = { model, messages, temperature: Number.isFinite(temperature) ? temperature : 0.2 };
   if (json) body.response_format = { type: 'json_object' };
   const send = () => fetch(base + '/chat/completions', {
     method: 'POST',
@@ -2531,7 +2721,7 @@ function closeAi() {
   $('aiBody').innerHTML = '';
   $('aiApply').hidden = true;
   aiPreview = null;
-  aiScriptPreview = null;
+  aiCombinedPreview = null;
 }
 
 function aiTagLine(tags, notes) {
@@ -2743,7 +2933,7 @@ async function aiApplySelection() {
   chapterToken++;
   stopPlayback();
   clearUrlCache();
-  if (book.chapters[chapterIdx]) chapterSegments = buildSegments(book.chapters[chapterIdx].content);
+  if (book.chapters[chapterIdx]) chapterSegments = buildSegments(book.chapters[chapterIdx].content, chapterIdx);
   currentSeg = -1;
   saveBookSoon();
   renderCast();
@@ -2784,7 +2974,152 @@ function aiParseScriptResult(j, from, to) {
   return out;
 }
 
-async function aiAnnotateChapter() {
+function aiKnownCastBrief() {
+  const map = new Map();
+  const put = (name, gender) => {
+    const n = canonical(name);
+    if (!n || n === '旁白' || n === '未知角色') return;
+    let e = map.get(n);
+    if (!e) { e = { name: n, gender: '?', aliases: new Set() }; map.set(n, e); }
+    if (gender === 'F' || gender === 'M') e.gender = gender;
+  };
+  for (const d of book.detected || []) put(d.name, d.gender);
+  for (const [name, entry] of Object.entries(book.cast || {})) put(name, entry?.gender);
+  for (const [alias, target] of Object.entries(book.aliases || {})) {
+    const n = canonical(target);
+    const e = map.get(n);
+    if (e && alias !== n) e.aliases.add(alias);
+  }
+  return [...map.values()].map((e) => ({ name: e.name, gender: e.gender, aliases: [...e.aliases].slice(0, 8) }));
+}
+
+function aiLaterText(ci, maxChars) {
+  let out = '';
+  for (let j = ci + 1; j < book.chapters.length && out.length < maxChars; j++) {
+    const head = `\n\n【第 ${j + 1} 章 ${book.chapters[j].title}】\n`;
+    if (out.length + head.length >= maxChars) break;
+    const room = maxChars - out.length - head.length;
+    out += head + book.chapters[j].content.slice(0, room);
+  }
+  return out.trim();
+}
+
+function aiUnknownConfidence(v) {
+  const t = String(v || '').trim().toLowerCase();
+  if (/^(low|低|低置信|不确定|猜测|weak)$/.test(t)) return 'low';
+  if (/^(high|高|高置信|明确|确定|strong)$/.test(t)) return 'high';
+  return 'medium';
+}
+
+function aiUnknownGender(v) {
+  const t = String(v || '').trim().toUpperCase();
+  if (t === 'F' || t === '女' || t === 'FEMALE') return 'F';
+  if (t === 'M' || t === '男' || t === 'MALE') return 'M';
+  return '?';
+}
+
+async function aiUnknownCore(chIdx, segs, signal) {
+  const title = book.chapters[chIdx].title;
+  const known = aiKnownCastBrief();
+  const later = aiLaterText(chIdx, AI_UNKNOWN_LOOKAHEAD);
+  const unknownIdx = [];
+  segs.forEach((s, i) => { if (s.speaker === '未知角色') unknownIdx.push(i); });
+  if (!unknownIdx.length) return { results: [], later, title, unknownIdx };
+  const payload = {
+    chapter: title,
+    known,
+    segs: segs.map((s, i) => ({ i, speaker: s.speaker, text: s.text })),
+    later,
+  };
+  const raw = await aiChat([
+    { role: 'system', content: AI_UNKNOWN_SYS },
+    { role: 'user', content: JSON.stringify(payload) },
+  ], { json: true, signal });
+  const j = parseAiJson(raw);
+  if (!j) throw new Error('说话人结果不是 JSON');
+  const arr = Array.isArray(j) ? j : (Array.isArray(j.unknowns) ? j.unknowns : (Array.isArray(j.lines) ? j.lines : []));
+  const unknownSet = new Set(unknownIdx);
+  const chapterText = segs.map((s) => s.text).join('\n');
+  const byI = new Map();
+  for (const it of arr) {
+    if (!it || typeof it !== 'object') continue;
+    let i = Number(it.i ?? it.index ?? it.idx);
+    if (!unknownSet.has(i)) {
+      const alt = i - 1;
+      if (unknownSet.has(alt)) i = alt;
+      else continue;
+    }
+    const confidence = aiUnknownConfidence(it.confidence);
+    const gHint = aiUnknownGender(it.gender);
+    let rawName = normalizeSpeakerName(it.speaker ?? it.name ?? '');
+    if (!rawName || rawName === '未知角色') rawName = gHint === 'F' ? '女声' : gHint === 'M' ? '男声' : '';
+    if (!rawName || rawName === '旁白') continue;
+    let speaker = canonical(rawName);
+    if (/^(男声|女声)/.test(speaker)) speaker = speaker[0] === '男' ? '男声' : '女声';
+    const isKnown = !!book.cast[speaker] || known.some((k) => k.name === speaker);
+    if (!isKnown && !aiValidName(speaker)) continue;
+    if (!isKnown && !isGenderVoice(speaker) && !chapterText.includes(speaker) && !later.includes(speaker)) continue;
+    byI.set(i, {
+      i,
+      text: segs[i].text,
+      speaker,
+      confidence,
+      gender: gHint,
+      basis: String(it.basis ?? it.evidence ?? it.reason ?? '').replace(/\s+/g, ' ').trim().slice(0, 160),
+      isNew: !isKnown,
+    });
+  }
+  return { results: [...byI.values()].sort((a, b) => a.i - b.i), later, title, unknownIdx };
+}
+
+async function aiScriptCore(chIdx, segs, { signal, onProgress } = {}) {
+  const title = book.chapters[chIdx].title;
+  const chunks = aiScriptChunks(segs);
+  const marks = new Map();
+  const errors = [];
+  for (let ci = 0; ci < chunks.length; ci++) {
+    if (signal?.aborted) break;
+    const c = chunks[ci];
+    onProgress?.(ci, chunks.length, c);
+    const lines = [];
+    for (let i = c.from; i <= c.to; i++) lines.push({ i, speaker: segs[i].speaker, text: segs[i].text });
+    const before = segs.slice(Math.max(0, c.from - 3), c.from).map((s) => ({ speaker: s.speaker, text: s.text }));
+    try {
+      const raw = await aiChat([
+        { role: 'system', content: AI_SCRIPT_SYS },
+        { role: 'user', content: JSON.stringify({ chapter: title, before, lines }) },
+      ], { json: true, signal });
+      const j = parseAiJson(raw);
+      if (!j) { errors.push(`第 ${ci + 1} 段：返回不是 JSON`); continue; }
+      for (const [i, tags] of aiParseScriptResult(j, c.from, c.to)) marks.set(i, tags);
+    } catch (e) {
+      if (e.name === 'AbortError') break;
+      errors.push(`第 ${ci + 1} 段：${e.message || e}`);
+    }
+  }
+  const lines = [...marks.entries()]
+    .map(([i, tags]) => ({ i, speaker: segs[i].speaker, text: segs[i].text, tags }))
+    .sort((a, b) => a.i - b.i);
+  return { lines, errors, chunks: chunks.length, title };
+}
+
+function aiUnknownRowHtml(r, idx) {
+  const gv = isGenderVoice(r.speaker);
+  const g = gv ? (r.speaker === '男声' ? 'M' : 'F') : (r.gender !== '?' ? r.gender : (book.cast[r.speaker]?.gender || '?'));
+  const conf = r.confidence === 'high' ? '高置信' : r.confidence === 'low' ? '低置信' : '待确认';
+  const badge = gv ? '<span class="ai-badge">音色占位</span>' : `<span class="ai-badge${r.isNew ? ' new' : ''}">${r.isNew ? '新增' : '已有'}</span>`;
+  return `<label class="ai-row">
+    <input type="checkbox" data-kind="u" data-i="${idx}" ${(r.confidence === 'high' || gv) ? 'checked' : ''}>
+    <div class="ai-main">
+      <div class="ai-name">第 ${r.i + 1} 句${badge}<span class="gchip g-${g}">${genderLabel(g)}</span><span class="ai-badge">${conf}</span></div>
+      <div class="ai-line-text">${escapeAttr(r.text)}</div>
+      <input class="cast-name combined-speaker" data-i="${idx}" value="${escapeAttr(r.speaker)}" placeholder="说话人">
+      <div class="ai-desc">依据：${escapeAttr(r.basis || '模型未说明')}</div>
+    </div>
+  </label>`;
+}
+
+async function aiFillChapter() {
   if (!book || !chapterSegments.length) return;
   const cfg = loadAi();
   if (!cfg.baseUrl || !cfg.key || !cfg.model) {
@@ -2795,103 +3130,135 @@ async function aiAnnotateChapter() {
   const chIdx = chapterIdx;
   const segs = chapterSegments.slice();
   const title = book.chapters[chIdx].title;
+  const unknownCount = segs.filter((s) => s.speaker === '未知角色').length;
   const totalChars = segs.reduce((n, s) => n + s.text.length, 0);
-  const estIn = Math.round(totalChars / 1.6);
-  const estOut = Math.round(segs.length * 18);
-  const replace = chapterScriptLines.size ? `本章已有 ${chapterScriptLines.size} 句标注，应用后将替换。` : '';
-  if (!confirm(`AI 标注第 ${chIdx + 1} 章语气：${segs.length} 段、约 ${totalChars} 字。\n预计输入约 ${(estIn / 10000).toFixed(1)} 万 tokens、输出约 ${(estOut / 10000).toFixed(2)} 万 tokens，会按模型价格计费。${replace}\n\n原文不会改动，只给每句加语气标签。确认继续？`)) return;
+  const chunkN = aiScriptChunks(segs).length;
+  const estIn = Math.round((totalChars + AI_UNKNOWN_LOOKAHEAD) / 1.6);
+  const estOut = Math.round(segs.length * 18 + unknownCount * 24);
+  const replace = chapterScriptLines.size ? `\n替换本章已有 ${chapterScriptLines.size} 句语气标注。` : '';
+  if (!confirm(`AI 补全第 ${chIdx + 1} 章：${segs.length} 段、${totalChars} 字、${unknownCount} 句未知。\n会补语气（分 ${chunkN} 次请求）并推断未知说话人（另 1 次），参考后文最多 3000 字；查不到名字按男声/女声占位。\n预计输入约 ${(estIn / 10000).toFixed(1)} 万 tokens、输出约 ${(estOut / 1000).toFixed(1)}k tokens，按模型价格计费。${replace}\n\n低置信的名字不会默认勾选。确认继续？`)) return;
 
-  const chunks = aiScriptChunks(segs);
-  const marks = new Map();
-  const errors = [];
   aiCancelled = false;
-  aiAbort = new AbortController();
-  openAi(`AI 语气标注中 · 第 ${chIdx + 1} 章`, `<div class="ai-sum" id="aiProgText">准备中…</div><div class="ai-progress"><i id="aiProgBar"></i></div><div class="ai-sum">可点“停止”中断；已发出的请求仍会计费。</div>`);
-  for (let ci = 0; ci < chunks.length; ci++) {
-    if (aiAbort && aiAbort.signal.aborted) break;
-    const c = chunks[ci];
-    const txt = $('aiProgText');
-    if (txt) txt.textContent = `第 ${ci + 1}/${chunks.length} 段 · 第 ${c.from + 1}–${c.to + 1} 句`;
-    const bar = $('aiProgBar');
-    if (bar) bar.style.width = `${Math.round((ci / chunks.length) * 100)}%`;
-    const lines = [];
-    for (let i = c.from; i <= c.to; i++) lines.push({ i, speaker: segs[i].speaker, text: segs[i].text });
-    const before = segs.slice(Math.max(0, c.from - 3), c.from).map((s) => ({ speaker: s.speaker, text: s.text }));
-    try {
-      const raw = await aiChat([
-        { role: 'system', content: AI_SCRIPT_SYS },
-        { role: 'user', content: `本章：${title}\n${JSON.stringify({ before, lines })}` },
-      ], { json: true, signal: aiAbort ? aiAbort.signal : undefined });
-      const j = parseAiJson(raw);
-      if (!j) { errors.push(`第 ${ci + 1} 段：返回不是 JSON`); continue; }
-      for (const [i, tags] of aiParseScriptResult(j, c.from, c.to)) marks.set(i, tags);
-    } catch (e) {
-      if (e.name === 'AbortError') break;
-      errors.push(`第 ${ci + 1} 段：${e.message || e}`);
-    }
+  const ctrl = new AbortController();
+  aiAbort = ctrl;
+  openAi(`AI 补全中 · 第 ${chIdx + 1} 章`, `<div class="ai-sum" id="aiProgText">准备中…</div><div class="ai-progress"><i id="aiProgBar"></i></div><div class="ai-sum">可点“停止”中断；已发出的请求仍会计费。</div>`);
+  const setProg = (txt, pct) => {
+    const t = $('aiProgText');
+    if (t) t.textContent = txt;
+    const b = $('aiProgBar');
+    if (b) b.style.width = `${Math.min(100, Math.max(0, pct))}%`;
+  };
+  let unknown = null;
+  let script = null;
+  let err = '';
+  try {
+    setProg(unknownCount ? '1/2 正在推断未知说话人…' : '1/2 本章没有未知角色，跳过', 4);
+    unknown = await aiUnknownCore(chIdx, segs, ctrl.signal);
+    if (aiCancelled) return;
+    setProg('2/2 正在标注语气…', 20);
+    script = await aiScriptCore(chIdx, segs, {
+      signal: ctrl.signal,
+      onProgress: (ci, n, c) => setProg(`2/2 语气标注 第 ${ci + 1}/${n} 段 · 第 ${c.from + 1}–${c.to + 1} 句`, 20 + Math.round((ci / n) * 80)),
+    });
+  } catch (e) {
+    if (e.name === 'AbortError') return;
+    err = e.message || String(e);
+  } finally {
+    if (aiAbort === ctrl) aiAbort = null;
   }
-  aiAbort = null;
   if (aiCancelled) return;
-  if (!marks.size) {
-    const errLine = errors.length ? `<div class="ai-err">${errors.slice(0, 5).map((e) => escapeAttr(e)).join('<br>')}</div>` : '';
-    openAi('AI 语气标注', `<div class="ai-sum">本章没有识别到明显的语气变化。</div>${errLine}`);
+  const bar = $('aiProgBar');
+  if (bar) bar.style.width = '100%';
+  if (err) {
+    openAi('AI 补全', `<div class="ai-sum">补全失败。</div><div class="ai-err">${escapeAttr(err)}</div>`);
     return;
   }
-  const lines = [...marks.entries()]
-    .map(([i, tags]) => ({ i, speaker: segs[i].speaker, text: segs[i].text, tags }))
-    .sort((a, b) => a.i - b.i);
-  aiScriptPreview = {
-    lines,
-    meta: { bookId: book.id, chapterIdx: chIdx, title, totalChars, estOut },
-  };
-  const rows = lines.map((l) => `<div class="ai-row">
-    <input type="checkbox" data-i="${l.i}" checked>
+  const ures = unknown?.results || [];
+  const slines = script?.lines || [];
+  const errLine = script?.errors?.length ? `<div class="ai-err">${script.errors.slice(0, 4).map((e) => escapeAttr(e)).join('<br>')}</div>` : '';
+  if (!ures.length && !slines.length) {
+    openAi('AI 补全', `<div class="ai-sum">没有可补的内容：本章语气比较平，未知说话人可以点句子前的手动指定。</div>${errLine}`);
+    return;
+  }
+  const genderFill = ures.filter((r) => isGenderVoice(r.speaker)).length;
+  const high = ures.filter((r) => r.confidence === 'high' && !isGenderVoice(r.speaker)).length;
+  const uRows = ures.map((r, idx) => aiUnknownRowHtml(r, idx)).join('');
+  const sRows = slines.map((l) => `<div class="ai-row">
+    <input type="checkbox" data-kind="s" data-i="${l.i}" checked>
     <div class="ai-main">
       <div class="ai-name"><span class="ai-badge">${escapeAttr(l.speaker)}</span><span class="ai-badge">第 ${l.i + 1} 句</span></div>
       <div class="ai-line-text">${escapeAttr(l.text)}</div>
-      <input class="cast-tags script-tags" data-i="${l.i}" value="${escapeAttr(l.tags)}" placeholder="本句语气，如：愤怒 语速较快">
+      <input class="cast-tags script-tags" data-i="${l.i}" value="${escapeAttr(l.tags)}" placeholder="本句语气">
     </div>
   </div>`).join('');
-  const metaLine = `第 ${chIdx + 1} 章 · ${lines.length} 句标注 · ${totalChars} 字 · 约 ${(estOut / 1000).toFixed(1)}k 输出 tokens`;
-  const errLine = errors.length ? `<div class="ai-err">${errors.slice(0, 4).map((e) => escapeAttr(e)).join('<br>')}</div>` : '';
-  openAi('AI 语气标注结果', `<div class="ai-sum">${metaLine}</div>${rows}${errLine}`, '应用标注');
+  const sum = [
+    `第 ${chIdx + 1} 章 · ${unknownCount} 句未知 → ${ures.length} 句有结果（${high} 高置信${genderFill ? `、${genderFill} 句男女声占位` : ''}）`,
+    `${slines.length} 句语气 · 参考后文 ${unknown?.later?.length || 0} 字`,
+  ].join('<br>');
+  const uSec = ures.length ? `<div class="ai-sec">说话人修正</div>${uRows}` : '';
+  const sSec = slines.length ? `<div class="ai-sec">语气标注</div>${sRows}` : '';
+  aiCombinedPreview = { meta: { bookId: book.id, chapterIdx: chIdx, title }, unknowns: ures, scripts: slines };
+  openAi('AI 补全结果', `<div class="ai-sum">${sum}</div>${uSec}${sSec}${errLine}`, '应用全部');
 }
 
-async function aiApplyScript() {
-  if (!aiScriptPreview) return;
-  const { lines, meta } = aiScriptPreview;
-  const picked = [];
-  for (const l of lines) {
-    const cb = document.querySelector(`#aiBody input[type=checkbox][data-i="${l.i}"]`);
-    if (cb && !cb.checked) continue;
-    const inp = document.querySelector(`#aiBody .script-tags[data-i="${l.i}"]`);
-    const tags = cleanLineTags(inp ? inp.value : l.tags);
-    if (!tags) continue;
-    picked.push({ i: l.i, text: l.text, tags });
-  }
-  await idb.put('scripts', {
-    key: `${meta.bookId}:${meta.chapterIdx}`,
-    bookId: meta.bookId,
-    chapterIdx: meta.chapterIdx,
-    chapterTitle: meta.title,
-    lines: picked,
-    updatedAt: Date.now(),
+async function aiApplyCombined() {
+  if (!aiCombinedPreview) return;
+  const { meta, unknowns, scripts } = aiCombinedPreview;
+  const pickedU = [];
+  document.querySelectorAll('#aiBody input[data-kind="u"]').forEach((cb) => {
+    if (!cb.checked) return;
+    const r = unknowns[+cb.dataset.i];
+    if (!r) return;
+    const inp = document.querySelector(`#aiBody .combined-speaker[data-i="${cb.dataset.i}"]`);
+    const name = normalizeSpeakerName(inp ? inp.value : r.speaker);
+    if (!name || name === '未知角色' || name === '旁白') return;
+    pickedU.push(Object.assign({}, r, { speaker: name }));
   });
-  if (book && book.id === meta.bookId && chapterIdx === meta.chapterIdx) {
-    chapterScriptLines = new Map();
-    for (const seg of chapterSegments) delete seg.lineTags;
-    for (const l of picked) {
-      const seg = chapterSegments[l.i];
-      if (!seg || seg.text !== l.text) continue;
-      seg.lineTags = l.tags;
-      chapterScriptLines.set(l.i, { i: l.i, text: l.text, speaker: seg.speaker, tags: l.tags });
-    }
-    clearUrlCache();
-    renderPlayer();
-    updatePlayerBar();
+  const pickedS = [];
+  document.querySelectorAll('#aiBody input[data-kind="s"]').forEach((cb) => {
+    if (!cb.checked) return;
+    const i = +cb.dataset.i;
+    const l = scripts.find((x) => x.i === i);
+    if (!l) return;
+    const inp = document.querySelector(`#aiBody .script-tags[data-i="${i}"]`);
+    const tags = cleanLineTags(inp ? inp.value : l.tags);
+    if (!tags) return;
+    pickedS.push({ i, text: l.text, tags });
+  });
+  if (!pickedU.length && !pickedS.length) { toast('没有勾选要应用的内容'); return; }
+  for (const r of pickedU) {
+    const cname = ensureSpeakerCast(r.speaker, r.gender);
+    upsertSpeakerFix(meta.chapterIdx, r.i, r.text, cname, r.basis, r.confidence);
+  }
+  if (pickedS.length) {
+    await idb.put('scripts', {
+      key: `${meta.bookId}:${meta.chapterIdx}`,
+      bookId: meta.bookId,
+      chapterIdx: meta.chapterIdx,
+      chapterTitle: meta.title,
+      lines: pickedS,
+      updatedAt: Date.now(),
+    });
   }
   closeAi();
-  toast(`已应用 ${picked.length} 句语气`);
+  if (book && book.id === meta.bookId && chapterIdx === meta.chapterIdx) {
+    if (pickedS.length) {
+      chapterScriptLines = new Map(pickedS.map((l) => [l.i, { i: l.i, text: l.text, speaker: chapterSegments[l.i]?.speaker, tags: l.tags }]));
+      for (const seg of chapterSegments) delete seg.lineTags;
+    }
+    if (pickedU.length) {
+      refreshAfterSpeakerFix();
+    } else if (pickedS.length) {
+      for (const l of pickedS) {
+        const seg = chapterSegments[l.i];
+        if (seg && seg.text === l.text) seg.lineTags = l.tags;
+      }
+      clearUrlCache();
+      renderPlayer();
+      updatePlayerBar();
+    }
+  }
+  toast(`已应用 ${pickedS.length} 句语气 · ${pickedU.length} 句说话人`);
 }
 
 function aiNudgeCheck() {  const el = $('aiNudge');
@@ -3042,10 +3409,47 @@ function bind() {
     if (nav === 'shelf') { showView('shelf'); renderShelf(); }
     else if (nav === 'book') { if (!book) { toast('先选一本书'); return; } showView('book'); }
     else if (nav === 'player') { if (!book) { toast('先选一本书'); return; } showView('player'); renderPlayer(); }
+    else if (nav === 'chat') {
+      if (!book) { toast('先选一本书'); return; }
+      showView('chat');
+      renderChatLobby();
+      loadChatStickers().catch(() => {});
+    }
     else { showView('settings'); renderSettings(); }
   });
 
   $('pbMain').addEventListener('click', () => { if (book) { showView('player'); renderSegHighlight(); } });
+  const segListEl = $('segList');
+  segListEl.addEventListener('touchstart', (e) => {
+    if (e.touches.length !== 1) { segTouchStart = null; return; }
+    const t = e.touches[0];
+    segTouchStart = { x: t.clientX, y: t.clientY };
+    segTouchMoved = false;
+  }, { passive: true });
+  segListEl.addEventListener('touchmove', (e) => {
+    if (!segTouchStart || !e.touches.length) return;
+    const t = e.touches[0];
+    if (Math.abs(t.clientX - segTouchStart.x) > 12 || Math.abs(t.clientY - segTouchStart.y) > 12) {
+      segTouchMoved = true;
+    }
+  }, { passive: true });
+  const endSegTouch = () => {
+    if (segTouchStart && segTouchMoved) segClickBlockedUntil = Date.now() + 300;
+    segTouchStart = null;
+    segTouchMoved = false;
+  };
+  segListEl.addEventListener('touchend', endSegTouch, { passive: true });
+  segListEl.addEventListener('touchcancel', endSegTouch, { passive: true });
+  segListEl.addEventListener('click', (e) => {
+    if (Date.now() < segClickBlockedUntil) { e.preventDefault(); e.stopPropagation(); return; }
+    const el = e.target.closest('.seg-item');
+    if (!el || !segListEl.contains(el)) return;
+    const i = Number(el.dataset.i);
+    if (!Number.isInteger(i)) return;
+    if (e.target.closest('.chip.unknown')) { assignSpeakerManually(i); return; }
+    if (currentView !== 'player') showView('player');
+    playIndex(i);
+  });
   $('btnPlay').addEventListener('click', togglePlay);
   $('btnPrev').addEventListener('click', () => playIndex(currentSeg - 1));
   $('btnNext').addEventListener('click', () => playIndex(currentSeg + 1));
@@ -3107,7 +3511,7 @@ function bind() {
 
   $('aiClose').addEventListener('click', closeAi);
   $('aiCancel').addEventListener('click', closeAi);
-  $('aiApply').addEventListener('click', () => { if (aiScriptPreview) aiApplyScript(); else aiApplySelection(); });
+  $('aiApply').addEventListener('click', () => { if (aiCombinedPreview) aiApplyCombined(); else aiApplySelection(); });
 
   $('btnAiNudge').addEventListener('click', aiAnalyzeBook);
   $('btnAiNudgeLater').addEventListener('click', () => {
@@ -3144,6 +3548,726 @@ function bind() {
   });
 }
 
+/* ---------------- 群聊 ---------------- */
+const CHAT_HISTORY = 24;
+const BUILTIN_STICKERS = [
+  ['微笑', '😊'], ['大笑', '😂'], ['偷笑', '🤭'], ['害羞', '😳'], ['无语', '😑'], ['翻白眼', '🙄'],
+  ['生气', '😤'], ['委屈', '🥺'], ['哭', '😭'], ['惊讶', '😲'], ['害怕', '😨'], ['得意', '😎'],
+  ['晚安', '😴'], ['赞', '👍'], ['抱抱', '🤗'], ['心碎', '💔'], ['疑惑', '🤔'], ['叹气', '😮‍💨'],
+];
+let chatGroups = [];
+let chat = null;
+let chatBusy = false;
+let chatStickers = [];
+let chatStickerMap = new Map();
+let chatAudio = null;
+let chatAudioUrl = '';
+let chatReplyToken = 0;
+let chatSaveTimer = 0;
+let chatRecording = null;
+let chatVoiceDraft = null;
+let chatModalApplyFn = null;
+
+function chatSaveSoon() {
+  if (!chat) return;
+  const doc = chat;
+  clearTimeout(chatSaveTimer);
+  chatSaveTimer = setTimeout(() => { idb.put('chats', doc).catch(() => {}); }, 400);
+}
+
+function chatMembersAll() {
+  if (!book) return [];
+  return castList().map(([n]) => canonical(n)).filter((n) => n && n !== '旁白' && !isGenderVoice(n));
+}
+
+function chatSpeakerColor(name) {
+  let h = 0;
+  for (const ch of String(name || '')) h = (h * 31 + ch.charCodeAt(0)) % 360;
+  return `hsl(${h} 55% 72%)`;
+}
+
+async function loadChatStickers() {
+  chatStickers = (await idb.all('stickers')).sort((a, b) => a.createdAt - b.createdAt);
+  chatStickerMap = new Map();
+  for (const [name, emoji] of BUILTIN_STICKERS) chatStickerMap.set(name, { type: 'emoji', emoji, name });
+  for (const s of chatStickers) chatStickerMap.set(s.name, { type: 'img', id: s.id, name: s.name });
+}
+
+function loadStickerImg(id, img) {
+  idb.get('stickers', id).then((rec) => {
+    if (!rec?.blob) return;
+    const url = URL.createObjectURL(rec.blob);
+    img.onload = () => URL.revokeObjectURL(url);
+    img.src = url;
+  }).catch(() => {});
+}
+
+async function renderChatLobby() {
+  chatCancelRecording();
+  if (chatAudio && !chatAudio.paused) chatAudio.pause();
+  chat = null;
+  chatReplyToken++;
+  chatBusy = false;
+  $('chatTyping').hidden = true;
+  $('chatLobby').hidden = false;
+  $('chatThread').hidden = true;
+  $('chatDock').hidden = true;
+  $('stickerPanel').hidden = true;
+  document.body.classList.remove('chat-thread');
+  $('topTitle').textContent = '群聊';
+  const list = $('chatGroupList');
+  list.innerHTML = '';
+  if (!book) {
+    $('chatEmpty').hidden = false;
+    $('chatEmpty').textContent = '先选一本书，再开群聊';
+    return;
+  }
+  chatGroups = (await idb.all('chats')).filter((c) => c.bookId === book.id).sort((a, b) => b.updatedAt - a.updatedAt);
+  $('chatEmpty').hidden = chatGroups.length > 0;
+  $('chatEmpty').textContent = '还没有群。选几个角色，开一个群聊。';
+  for (const c of chatGroups) {
+    const item = document.createElement('div');
+    item.className = 'chat-group';
+    const last = c.messages?.[c.messages.length - 1];
+    let preview = '还没有消息';
+    if (last) {
+      if (last.type === 'sys') preview = last.text || '';
+      else if (last.type === 'sticker') preview = `${last.role === 'user' ? '我' : last.speaker}发了一个表情`;
+      else if (last.type === 'uservoice') preview = `我：${last.text || '[语音]'}`;
+      else preview = `${last.role === 'user' ? '我' : last.speaker}：${last.text || ''}`;
+    }
+    item.innerHTML = `
+      <div class="chat-avatar">群</div>
+      <div class="chat-group-info">
+        <div class="chat-group-name"></div>
+        <div class="chat-group-desc"></div>
+      </div>`;
+    item.querySelector('.chat-group-name').textContent = c.name;
+    item.querySelector('.chat-group-desc').textContent = `${c.members.length} 人 · ${preview}`;
+    item.addEventListener('click', () => openChatGroup(c.id));
+    list.appendChild(item);
+  }
+}
+
+async function openChatGroup(id) {
+  const c = await idb.get('chats', id);
+  if (!c) { toast('群不见了'); renderChatLobby(); return; }
+  await loadChatStickers();
+  if (chatAudio && !chatAudio.paused) chatAudio.pause();
+  chat = c;
+  if (!Array.isArray(chat.messages)) chat.messages = [];
+  chatReplyToken++;
+  chatBusy = false;
+  $('chatTyping').hidden = true;
+  $('btnChatSend').disabled = false;
+  $('chatLobby').hidden = true;
+  $('chatThread').hidden = false;
+  $('chatDock').hidden = false;
+  $('stickerPanel').hidden = true;
+  document.body.classList.add('chat-thread');
+  $('topTitle').textContent = chat.name;
+  renderChatHeader();
+  renderChatMessages();
+  setTimeout(() => window.scrollTo(0, document.body.scrollHeight), 30);
+}
+
+function renderChatHeader() {
+  if (!chat) return;
+  $('chatTitle').textContent = chat.name;
+  const sub = [chat.members.join(' · '), chat.scene ? chat.scene : ''].filter(Boolean).join(' ｜ ');
+  $('chatSub').textContent = sub;
+}
+
+function renderChatMessages() {
+  const box = $('chatMsgs');
+  box.innerHTML = '';
+  if (!chat || !chat.messages.length) {
+    const d = document.createElement('div');
+    d.className = 'cmsg sys placeholder';
+    d.innerHTML = '<div class="cbubble">群已建好，说点什么吧</div>';
+    box.appendChild(d);
+    return;
+  }
+  let prev = '';
+  for (const m of chat.messages) {
+    box.appendChild(chatMsgEl(m, m.speaker !== prev));
+    prev = m.speaker || '';
+  }
+}
+
+function chatMsgEl(m, showName) {
+  if (m.type === 'sys') {
+    const el = document.createElement('div');
+    el.className = 'cmsg sys';
+    el.dataset.mid = m.id;
+    el.innerHTML = '<div class="cbubble"></div>';
+    el.querySelector('.cbubble').textContent = m.text || '';
+    return el;
+  }
+  const el = document.createElement('div');
+  el.className = 'cmsg' + (m.role === 'user' ? ' me' : '');
+  el.dataset.mid = m.id;
+  const av = document.createElement('div');
+  av.className = 'cavatar';
+  if (m.role === 'user') av.textContent = '我';
+  else {
+    av.textContent = String(m.speaker || '?').slice(0, 1);
+    av.style.color = chatSpeakerColor(m.speaker);
+  }
+  const body = document.createElement('div');
+  body.className = 'cmsg-body';
+  if (m.role === 'char' && showName) {
+    const n = document.createElement('div');
+    n.className = 'cmsg-name';
+    n.textContent = m.speaker;
+    body.appendChild(n);
+  }
+  const bubble = document.createElement('div');
+  bubble.className = 'cbubble';
+  if (m.type === 'sticker') {
+    bubble.classList.add('csticker');
+    const info = chatStickerMap.get(m.sticker);
+    if (info?.type === 'emoji') bubble.textContent = info.emoji;
+    else if (info?.type === 'img') {
+      const img = document.createElement('img');
+      loadStickerImg(info.id, img);
+      bubble.appendChild(img);
+    } else bubble.textContent = m.sticker ? `[${m.sticker}]` : '🙂';
+  } else if (m.type === 'uservoice' || m.type === 'voice') {
+    const v = document.createElement('div');
+    v.className = 'cvoice';
+    v.innerHTML = '<span>🔊</span><span class="cwave">▁▂▃▂▁</span><span class="cdur"></span>';
+    v.querySelector('.cdur').textContent = m.dur ? `${Math.round(m.dur)}″` : '';
+    v.addEventListener('click', (e) => { e.stopPropagation(); chatPlayVoiceMsg(m, v); });
+    bubble.appendChild(v);
+    if (m.text) {
+      const t = document.createElement('div');
+      t.className = 'cvoice-text';
+      t.textContent = m.text;
+      bubble.appendChild(t);
+    }
+  } else {
+    bubble.textContent = m.text || '';
+  }
+  if (m.role === 'char' && m.type === 'text' && m.text) {
+    const vb = document.createElement('button');
+    vb.className = 'cvoice-hint';
+    vb.textContent = '🔊 语音';
+    vb.title = '用角色音色读出来';
+    vb.addEventListener('click', (e) => { e.stopPropagation(); chatPlayTextTTS(m, vb); });
+    bubble.appendChild(vb);
+  }
+  body.appendChild(bubble);
+  el.appendChild(av);
+  el.appendChild(body);
+  return el;
+}
+
+function chatPush(msg) {
+  if (!chat) return null;
+  const m = Object.assign({ id: uid(), at: Date.now() }, msg);
+  chat.messages.push(m);
+  chat.updatedAt = Date.now();
+  const box = $('chatMsgs');
+  box.querySelector('.cmsg.placeholder')?.remove();
+  const near = window.innerHeight + window.scrollY >= document.body.scrollHeight - 200;
+  box.appendChild(chatMsgEl(m, true));
+  chatSaveSoon();
+  if (near) window.scrollTo(0, document.body.scrollHeight);
+  return m;
+}
+
+async function audioDuration(blob) {
+  return new Promise((resolve) => {
+    const a = new Audio();
+    const url = URL.createObjectURL(blob);
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      URL.revokeObjectURL(url);
+      resolve(Number.isFinite(a.duration) ? a.duration : 0);
+    };
+    a.onloadedmetadata = finish;
+    a.onerror = finish;
+    setTimeout(finish, 2500);
+    a.preload = 'metadata';
+    a.src = url;
+  });
+}
+
+function playChatBlob(blob) {
+  if (!chatAudio) chatAudio = new Audio();
+  if (!chatAudio.paused) chatAudio.pause();
+  if (chatAudioUrl) URL.revokeObjectURL(chatAudioUrl);
+  chatAudioUrl = URL.createObjectURL(blob);
+  chatAudio.src = chatAudioUrl;
+  if (playing) audioEl.pause();
+  chatAudio.play().catch(() => toast('播放失败', 3000));
+}
+
+async function chatTTSBlob(m) {
+  if (m.mediaId) {
+    const rec = await idb.get('chatMedia', m.mediaId);
+    if (rec?.blob) return rec.blob;
+  }
+  if (!book || !chat) throw new Error('没有打开群聊');
+  const chatId = chat.id;
+  const entry = castEntryAt(m.speaker, chapterIdx);
+  let voice = entry?.voice || '苏打';
+  let tags = '', card = '', cloneUri = '';
+  if (entry?.clone) {
+    const cs = await getCloneSample(book.id, m.speaker);
+    if (cs?.dataUri) cloneUri = cs.dataUri;
+  }
+  if (!cloneUri) {
+    tags = entry ? stageTags(null, entry) : '';
+    card = entry ? speechCard(entry, null) : '';
+  }
+  const blob = await requestTTS(m.text, voice, tags, card, undefined, cloneUri);
+  const dur = Math.round(await audioDuration(blob));
+  const id = uid();
+  await idb.put('chatMedia', { id, chatId, kind: 'voice', blob, createdAt: Date.now() });
+  m.mediaId = id;
+  m.dur = dur;
+  chatSaveSoon();
+  return blob;
+}
+
+async function chatPlayTextTTS(m, btn) {
+  const old = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '合成中…';
+  try {
+    const blob = await chatTTSBlob(m);
+    if (btn.isConnected) { btn.disabled = false; btn.textContent = old; }
+    playChatBlob(blob);
+  } catch (e) {
+    if (btn.isConnected) { btn.disabled = false; btn.textContent = old; }
+    toast('语音生成失败：' + (e.message || e), 4000);
+  }
+}
+
+async function chatPlayVoiceMsg(m, el) {
+  if (!m.mediaId) { toast('这条语音已经找不到了'); return; }
+  el.classList.add('loading');
+  try {
+    const rec = await idb.get('chatMedia', m.mediaId);
+    if (!rec?.blob) { toast('语音数据不见了'); return; }
+    if (!m.dur) { m.dur = Math.round(await audioDuration(rec.blob)); chatSaveSoon(); }
+    playChatBlob(rec.blob);
+  } finally {
+    el.classList.remove('loading');
+  }
+}
+
+function chatExtractStickers(text) {
+  let rest = String(text || '');
+  const found = [];
+  const re = /\[([^\[\]]{1,8})\]/g;
+  let m;
+  while ((m = re.exec(rest))) {
+    if (chatStickerMap.has(m[1]) && !found.includes(m[1])) found.push(m[1]);
+  }
+  for (const n of found) rest = rest.split(`[${n}]`).join('');
+  return { text: rest.replace(/\s{2,}/g, ' ').trim(), stickers: found };
+}
+
+function chatMemberBrief(name) {
+  const e = castEntryAt(name, chapterIdx) || {};
+  const d = (book.detected || []).find((x) => canonical(x.name) === canonical(name));
+  const bits = [name];
+  if (e.gender === 'F') bits.push('女');
+  else if (e.gender === 'M') bits.push('男');
+  const tone = String(e.style || d?.tone || '').trim();
+  if (tone) bits.push(tone);
+  const desc = String(e.voiceDesc || '').trim();
+  if (desc) bits.push(desc.slice(0, 60));
+  if (e) {
+    const tags = stageTags(null, e);
+    if (tags) bits.push('语气:' + tags);
+  }
+  return bits.join('｜');
+}
+
+function chatSystemPrompt() {
+  const members = chat.members.map(chatMemberBrief).join('\n');
+  const stickerNames = [...chatStickerMap.keys()].slice(0, 40).join('、');
+  return `你是一个中文群聊扮演引擎，同时扮演群里的多个角色，和用户（我）聊天。
+群名：${chat.name}
+场景/设定：${chat.scene || '日常闲聊'}
+成员：
+${members}
+
+规则：
+- 只输出 1-${chat.replyMax} 条消息，像即时聊天一样短，每条 6-40 字，口语化，可以带（）里的动作。
+- speaker 必须是成员名字之一，保持各角色的性格和说话习惯。
+- 可以自然接话、吐槽、互怼，但不要替用户说话，也不要写旁白。
+- 想发表情时，在 text 末尾用 [表情名]；可用表情：${stickerNames}。表情名必须与列表完全一致，不要自造。
+- 只输出 JSON：{"replies":[{"speaker":"角色名","text":"内容"}]}
+- 不要输出解释。`;
+}
+
+function chatHistoryMessage() {
+  const recent = chat.messages.filter((m) => m.type !== 'sys').slice(-CHAT_HISTORY);
+  const lines = recent.map((m) => {
+    if (m.type === 'sticker') return `${m.role === 'user' ? '我' : m.speaker}：[表情:${m.sticker}]`;
+    if (m.type === 'uservoice') return `我：[语音] ${m.text || '（只发了语音）'}`;
+    return `${m.role === 'user' ? '我' : m.speaker}：${m.text || ''}`;
+  });
+  return `最近的聊天记录：\n${lines.join('\n')}\n\n请继续群聊，只输出 JSON。`;
+}
+
+async function chatAskAi() {
+  if (!chat || chatBusy) return;
+  if (!chatStickerMap.size) await loadChatStickers();
+  const cfg = loadAi();
+  if (!cfg.baseUrl || !cfg.key || !cfg.model) {
+    toast('先在设置里填写 AI API Key');
+    showView('settings');
+    return;
+  }
+  const token = ++chatReplyToken;
+  const chatId = chat.id;
+  chatBusy = true;
+  $('chatTyping').hidden = false;
+  $('btnChatSend').disabled = true;
+  try {
+    const raw = await aiChat([
+      { role: 'system', content: chatSystemPrompt() },
+      { role: 'user', content: chatHistoryMessage() },
+    ], { json: true, temperature: 0.85 });
+    if (token !== chatReplyToken || !chat || chat.id !== chatId) return;
+    const j = parseAiJson(raw);
+    const list = Array.isArray(j) ? j
+      : (Array.isArray(j?.replies) ? j.replies
+        : (Array.isArray(j?.messages) ? j.messages : (Array.isArray(j?.lines) ? j.lines : [])));
+    const replies = [];
+    for (const it of list) {
+      if (!it || typeof it !== 'object') continue;
+      let speaker = canonical(String(it.speaker ?? it.name ?? '').trim());
+      if (speaker && !chat.members.includes(speaker)) {
+        const hit = chat.members.find((n) => speaker.includes(n));
+        if (hit) speaker = hit;
+      }
+      if (!speaker || !chat.members.includes(speaker)) continue;
+      const text = String(it.text ?? it.content ?? '').trim().slice(0, 300);
+      const sticker = String(it.sticker ?? '').replace(/[\[\]]/g, '').trim();
+      if (!text && !sticker) continue;
+      replies.push({ speaker, text, sticker });
+      if (replies.length >= chat.replyMax) break;
+    }
+    if (!replies.length) {
+      chatPush({ role: 'char', type: 'sys', text: '（AI 这次没有接话，再发一句试试）' });
+      return;
+    }
+    for (let k = 0; k < replies.length; k++) {
+      await new Promise((r) => setTimeout(r, k === 0 ? 350 : 600 + Math.random() * 600));
+      if (token !== chatReplyToken || !chat || chat.id !== chatId) return;
+      const r = replies[k];
+      const ex = chatExtractStickers(r.text);
+      if (ex.text) chatPush({ role: 'char', speaker: r.speaker, type: 'text', text: ex.text });
+      const extra = r.sticker && chatStickerMap.has(r.sticker) ? [r.sticker] : [];
+      const stickers = [...new Set([...extra, ...ex.stickers])].slice(0, 2);
+      for (const s of stickers) chatPush({ role: 'char', speaker: r.speaker, type: 'sticker', sticker: s });
+    }
+  } catch (e) {
+    if (e.name === 'AbortError') return;
+    toast('AI 回复失败：' + (e.message || e), 5000);
+  } finally {
+    if (token === chatReplyToken) {
+      chatBusy = false;
+      $('chatTyping').hidden = true;
+      $('btnChatSend').disabled = false;
+    }
+  }
+}
+
+async function chatSendText() {
+  const input = $('chatInput');
+  const text = input.value.trim();
+  if (!chat || !text) return;
+  if (chatBusy) { toast('等角色们说完再发', 1500); return; }
+  input.value = '';
+  input.style.height = 'auto';
+  $('stickerPanel').hidden = true;
+  $('btnChatSticker').classList.remove('on');
+  chatPush({ role: 'user', type: 'text', text });
+  await chatAskAi();
+}
+
+function chatSendSticker(name) {
+  if (!chat) return;
+  if (chatBusy) { toast('等角色们说完再发', 1500); return; }
+  $('stickerPanel').hidden = true;
+  $('btnChatSticker').classList.remove('on');
+  chatPush({ role: 'user', type: 'sticker', sticker: name });
+  chatAskAi();
+}
+
+async function chatToggleRecord() {
+  const btn = $('btnChatMic');
+  if (!chat) return;
+  if (chatRecording) {
+    try { chatRecording.rec.stop(); } catch {}
+    return;
+  }
+  if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
+    toast('这个浏览器不支持录音', 3000);
+    return;
+  }
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch {
+    toast('没有麦克风权限', 3000);
+    return;
+  }
+  const rec = new MediaRecorder(stream);
+  const chunks = [];
+  const startedAt = Date.now();
+  rec.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
+  rec.onstop = async () => {
+    stream.getTracks().forEach((t) => t.stop());
+    chatRecording = null;
+    btn.classList.remove('rec');
+    btn.textContent = '🎙';
+    const dur = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
+    const blob = new Blob(chunks, { type: rec.mimeType || 'audio/webm' });
+    if (blob.size < 800) { toast('录音太短', 2000); return; }
+    openVoiceDraft(blob, dur);
+  };
+  chatRecording = { rec, stream };
+  rec.start();
+  btn.classList.add('rec');
+  btn.textContent = '■';
+  toast('正在录音，再点一次结束', 2500);
+}
+
+function chatCancelRecording() {
+  if (!chatRecording) return;
+  const { rec, stream } = chatRecording;
+  chatRecording = null;
+  try { rec.onstop = null; rec.stop(); } catch {}
+  try { stream.getTracks().forEach((t) => t.stop()); } catch {}
+  const btn = $('btnChatMic');
+  if (btn) { btn.classList.remove('rec'); btn.textContent = '🎙'; }
+}
+
+function openVoiceDraft(blob, dur) {
+  chatVoiceDraft = { blob, dur };
+  const url = URL.createObjectURL(blob);
+  openChatModal('发送语音', `
+    <div class="chat-field"><span>语音 ${dur}″</span><audio class="voice-preview" controls src="${url}"></audio></div>
+    <div class="chat-field"><span>附带文字（可选，AI 会读这段；留空就只发语音）</span><textarea id="voiceText" rows="2" placeholder="想说的话…"></textarea></div>
+  `, '发送', async () => {
+    if (!chat) return;
+    const text = ($('voiceText')?.value || '').trim().slice(0, 500);
+    const mediaId = uid();
+    await idb.put('chatMedia', { id: mediaId, chatId: chat.id, kind: 'voice', blob, createdAt: Date.now() });
+    closeChatModal();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    chatPush({ role: 'user', type: 'uservoice', text, mediaId, dur });
+    await chatAskAi();
+  });
+}
+
+function openChatModal(title, html, applyLabel, onApply) {
+  $('chatModalTitle').textContent = title;
+  $('chatModalBody').innerHTML = html;
+  const apply = $('chatModalApply');
+  apply.hidden = !applyLabel;
+  apply.disabled = false;
+  apply.textContent = applyLabel || '';
+  chatModalApplyFn = onApply || null;
+  $('chatOverlay').hidden = false;
+}
+
+function closeChatModal() {
+  $('chatOverlay').hidden = true;
+  $('chatModalBody').innerHTML = '';
+  chatModalApplyFn = null;
+  chatVoiceDraft = null;
+}
+
+function openCreateGroup() {
+  if (!book) { toast('先选一本书'); return; }
+  const names = chatMembersAll();
+  if (!names.length) { toast('还没有角色，先去角色卡解析或添加'); return; }
+  const checks = names.map((n) => `<label class="chat-member"><input type="checkbox" value="${escapeAttr(n)}"> ${escapeAttr(n)}</label>`).join('');
+  openChatModal('新建群聊', `
+    <div class="chat-field"><span>群名</span><input type="text" id="groupName" placeholder="例如：深夜便利店"></div>
+    <div class="chat-field"><span>场景 / 设定（可选）</span><textarea id="groupScene" rows="2" placeholder="例如：三个人被困在雨夜的便利店，气氛微妙。"></textarea></div>
+    <div class="chat-field"><span>成员</span><div class="chat-members" id="groupMembers">${checks}</div></div>
+    <div class="chat-field"><span>每轮最多几条回复（1–3）</span><input type="text" id="groupReplyMax" value="2" inputmode="numeric"></div>
+    <div class="chat-note">每发一条消息会调用一次 AI（按模型价格计费）。语音条点按才合成，不会自动生成。</div>
+  `, '建群', async () => {
+    const picked = [...document.querySelectorAll('#groupMembers input:checked')].map((i) => i.value);
+    if (!picked.length) { toast('至少选一个角色'); return; }
+    const name = ($('groupName')?.value || '').trim().slice(0, 20) || picked.slice(0, 3).join('、');
+    const scene = ($('groupScene')?.value || '').trim().slice(0, 400);
+    const replyMax = Math.min(3, Math.max(1, parseInt($('groupReplyMax')?.value, 10) || 2));
+    const c = {
+      id: uid(), bookId: book.id, name, scene, members: picked, replyMax,
+      messages: [], createdAt: Date.now(), updatedAt: Date.now(),
+    };
+    await idb.put('chats', c);
+    closeChatModal();
+    await renderChatLobby();
+    await openChatGroup(c.id);
+  });
+}
+
+function openChatSettings() {
+  if (!chat) return;
+  const all = [...new Set([...chat.members, ...chatMembersAll()])];
+  const checks = all.map((n) => `<label class="chat-member"><input type="checkbox" value="${escapeAttr(n)}"${chat.members.includes(n) ? ' checked' : ''}> ${escapeAttr(n)}</label>`).join('');
+  openChatModal('群设置', `
+    <div class="chat-field"><span>群名</span><input type="text" id="groupName" value="${escapeAttr(chat.name)}"></div>
+    <div class="chat-field"><span>场景 / 设定</span><textarea id="groupScene" rows="3">${escapeAttr(chat.scene || '')}</textarea></div>
+    <div class="chat-field"><span>成员</span><div class="chat-members" id="groupMembers">${checks}</div></div>
+    <div class="chat-field"><span>每轮最多几条回复（1–3）</span><input type="text" id="groupReplyMax" value="${chat.replyMax || 2}" inputmode="numeric"></div>
+    <div class="row" style="margin-top:4px">
+      <button id="btnClearChat" class="btn">清空聊天记录</button>
+      <button id="btnDelGroup" class="btn danger">删除群</button>
+    </div>
+  `, '保存', async () => {
+    const picked = [...document.querySelectorAll('#groupMembers input:checked')].map((i) => i.value);
+    if (!picked.length) { toast('至少留一个角色'); return; }
+    chat.name = ($('groupName')?.value || '').trim().slice(0, 20) || chat.name;
+    chat.scene = ($('groupScene')?.value || '').trim().slice(0, 400);
+    chat.members = picked;
+    chat.replyMax = Math.min(3, Math.max(1, parseInt($('groupReplyMax')?.value, 10) || 2));
+    chat.updatedAt = Date.now();
+    await idb.put('chats', chat);
+    closeChatModal();
+    renderChatHeader();
+    renderChatMessages();
+    $('topTitle').textContent = chat.name;
+    toast('已保存');
+  });
+  $('btnClearChat')?.addEventListener('click', async () => {
+    if (!confirm('清空这个群的全部聊天记录？')) return;
+    chat.messages = [];
+    chat.updatedAt = Date.now();
+    await idb.put('chats', chat);
+    closeChatModal();
+    renderChatMessages();
+    toast('已清空');
+  });
+  $('btnDelGroup')?.addEventListener('click', async () => {
+    if (!confirm(`删除群「${chat.name}」和它的全部语音、表情消息？`)) return;
+    const id = chat.id;
+    await idb.del('chats', id);
+    await deleteChatMediaOf(id);
+    closeChatModal();
+    toast('群已删除');
+    await renderChatLobby();
+  });
+}
+
+function deleteChatMediaOf(chatId) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('chatMedia', 'readwrite');
+    const idx = tx.objectStore('chatMedia').index('chatId');
+    const req = idx.openCursor(IDBKeyRange.only(chatId));
+    req.onsuccess = () => {
+      const cur = req.result;
+      if (cur) { cur.delete(); cur.continue(); }
+    };
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+function renderStickerGrid() {
+  const grid = $('stickerGrid');
+  grid.innerHTML = '';
+  for (const [name, emoji] of BUILTIN_STICKERS) {
+    const b = document.createElement('button');
+    b.className = 'sticker-item';
+    b.textContent = emoji;
+    b.title = name;
+    b.addEventListener('click', () => chatSendSticker(name));
+    grid.appendChild(b);
+  }
+  for (const s of chatStickers) {
+    const b = document.createElement('button');
+    b.className = 'sticker-item';
+    b.title = `${s.name}（长按删除）`;
+    const img = document.createElement('img');
+    loadStickerImg(s.id, img);
+    b.appendChild(img);
+    b.addEventListener('click', () => chatSendSticker(s.name));
+    b.addEventListener('contextmenu', async (e) => {
+      e.preventDefault();
+      if (!confirm(`删除表情「${s.name}」？`)) return;
+      await idb.del('stickers', s.id);
+      await loadChatStickers();
+      renderStickerGrid();
+    });
+    grid.appendChild(b);
+  }
+}
+
+function bindChat() {
+  $('btnNewGroup').addEventListener('click', openCreateGroup);
+  $('btnChatBack').addEventListener('click', () => { renderChatLobby(); window.scrollTo(0, 0); });
+  $('btnChatSettings').addEventListener('click', openChatSettings);
+  $('btnChatSend').addEventListener('click', chatSendText);
+  $('btnChatMic').addEventListener('click', chatToggleRecord);
+
+  const input = $('chatInput');
+  const grow = () => {
+    input.style.height = 'auto';
+    input.style.height = Math.min(96, input.scrollHeight) + 'px';
+  };
+  input.addEventListener('input', grow);
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+      e.preventDefault();
+      chatSendText();
+    }
+  });
+
+  $('btnChatSticker').addEventListener('click', async () => {
+    const panel = $('stickerPanel');
+    if (!panel.hidden) { panel.hidden = true; $('btnChatSticker').classList.remove('on'); return; }
+    await loadChatStickers();
+    renderStickerGrid();
+    panel.hidden = false;
+    $('btnChatSticker').classList.add('on');
+  });
+
+  $('btnStickerAdd').addEventListener('click', () => $('stickerInput').click());
+  $('stickerInput').addEventListener('change', async (e) => {
+    const files = [...(e.target.files || [])];
+    e.target.value = '';
+    let n = 0;
+    for (const f of files) {
+      if (!/^image\//.test(f.type)) continue;
+      const name = (f.name.replace(/\.[^.]+$/, '') || '表情').trim().slice(0, 6) || '表情';
+      await idb.put('stickers', { id: uid(), name, blob: f, mime: f.type, createdAt: Date.now() });
+      n++;
+    }
+    if (!n) return;
+    await loadChatStickers();
+    renderStickerGrid();
+    toast(`已添加 ${n} 个表情`);
+  });
+
+  $('chatModalClose').addEventListener('click', closeChatModal);
+  $('chatModalCancel').addEventListener('click', closeChatModal);
+  $('chatModalApply').addEventListener('click', async () => {
+    const fn = chatModalApplyFn;
+    if (!fn) return;
+    const btn = $('chatModalApply');
+    btn.disabled = true;
+    try { await fn(); } finally { btn.disabled = false; }
+  });
+  $('chatOverlay').addEventListener('click', (e) => { if (e.target === $('chatOverlay')) closeChatModal(); });
+}
+
 /* ---------------- 启动 ---------------- */
 (async function init() {
   try {
@@ -3153,6 +4277,7 @@ function bind() {
     return;
   }
   bind();
+  bindChat();
   await renderShelf();
   showView('shelf');
   $('topTitle').textContent = 'TXT 听书';

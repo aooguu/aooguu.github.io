@@ -119,7 +119,62 @@
       <p class="hint" id="appVer"></p>
     </div>
   </section>
+
+  <section id="view-chat" class="view" hidden>
+    <div id="chatLobby">
+      <div class="chat-lobby-head">
+        <div class="section-title">群聊</div>
+        <button id="btnNewGroup" class="mini-btn">＋ 新建群</button>
+      </div>
+      <div id="chatGroupList" class="list"></div>
+      <div id="chatEmpty" class="empty">还没有群。选几个角色，开一个群聊。</div>
+      <p class="hint">群里每个角色用角色卡里的音色说话；文字回复由 AI 生成，语音条点一下才合成。表情和录音只存在本机。</p>
+    </div>
+    <div id="chatThread" hidden>
+      <div class="chat-head">
+        <button id="btnChatBack" class="icon-btn" title="返回">‹</button>
+        <div class="chat-head-main">
+          <div id="chatTitle" class="chat-title"></div>
+          <div id="chatSub" class="chat-sub"></div>
+        </div>
+        <button id="btnChatSettings" class="icon-btn" title="群设置">⚙</button>
+      </div>
+      <div id="chatMsgs" class="chat-msgs"></div>
+      <div id="chatTyping" class="chat-typing" hidden><span class="spin"></span> 正在输入…</div>
+    </div>
+  </section>
 </main>
+
+<div id="chatDock" hidden>
+  <div id="stickerPanel" class="sticker-panel" hidden>
+    <div class="sticker-head">
+      <span>表情包</span>
+      <button id="btnStickerAdd" class="mini-btn">＋ 添加图片</button>
+    </div>
+    <div id="stickerGrid" class="sticker-grid"></div>
+    <input type="file" id="stickerInput" accept="image/*" multiple hidden>
+  </div>
+  <div class="chat-composer">
+    <button id="btnChatSticker" class="chat-tool" title="表情包">☺</button>
+    <button id="btnChatMic" class="chat-tool" title="录音">🎙</button>
+    <textarea id="chatInput" rows="1" placeholder="说点什么…"></textarea>
+    <button id="btnChatSend" class="chat-send">发送</button>
+  </div>
+</div>
+
+<div id="chatOverlay" class="overlay" hidden>
+  <div class="modal">
+    <div class="modal-head">
+      <span id="chatModalTitle">群聊</span>
+      <button id="chatModalClose" class="icon-btn" title="关闭">✕</button>
+    </div>
+    <div id="chatModalBody" class="modal-body"></div>
+    <div class="modal-foot">
+      <button id="chatModalCancel" class="btn">取消</button>
+      <button id="chatModalApply" class="btn primary" hidden>确定</button>
+    </div>
+  </div>
+</div>
 
 <div id="aiOverlay" class="overlay" hidden>
   <div class="modal">
@@ -151,6 +206,7 @@
   <button class="tab active" data-nav="shelf"><span>▤</span>书架</button>
   <button class="tab" data-nav="book"><span>☰</span>本书</button>
   <button class="tab" data-nav="player"><span>◉</span>播放</button>
+  <button class="tab" data-nav="chat"><span>☰</span>群聊</button>
   <button class="tab" data-nav="settings"><span>⚙</span>设置</button>
 </nav>
 
