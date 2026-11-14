@@ -3,7 +3,7 @@
 const DEFAULT_BASE = 'https://api.xiaomimimo.com/v1';
 const AI_DEFAULT_BASE = 'https://api.deepseek.com/v1';
 const AI_DEFAULT_MODEL = 'deepseek-chat';
-const APP_VER = 'v18';
+const APP_VER = 'v19';
 const VOICES = [
   { id: '冰糖', label: '冰糖 · 中文女声' },
   { id: '茉莉', label: '茉莉 · 中文女声' },
@@ -3536,6 +3536,7 @@ function bind() {
 
 /* ---------------- 群聊 ---------------- */
 const CHAT_HISTORY = 24;
+const STICKER_NAME_MAX = 12;
 const BUILTIN_STICKERS = [
   ['微笑', '😊'], ['大笑', '😂'], ['偷笑', '🤭'], ['害羞', '😳'], ['无语', '😑'], ['翻白眼', '🙄'],
   ['生气', '😤'], ['委屈', '🥺'], ['哭', '😭'], ['惊讶', '😲'], ['害怕', '😨'], ['得意', '😎'],
@@ -3848,7 +3849,7 @@ async function chatPlayVoiceMsg(m, el) {
 function chatExtractStickers(text) {
   let rest = String(text || '');
   const found = [];
-  const re = /\[([^\[\]]{1,8})\]/g;
+  const re = /\[([^\[\]]{1,12})\]/g;
   let m;
   while ((m = re.exec(rest))) {
     if (chatStickerMap.has(m[1]) && !found.includes(m[1])) found.push(m[1]);
@@ -3876,7 +3877,7 @@ function chatMemberBrief(name) {
 
 function chatSystemPrompt() {
   const members = chat.members.map(chatMemberBrief).join('\n');
-  const stickerNames = [...chatStickerMap.keys()].slice(0, 40).join('、');
+  const stickerNames = [...chatStickerMap.keys()].join('、');
   return `你是一个中文群聊扮演引擎，同时扮演群里的多个角色，和用户（我）聊天。
 群名：${chat.name}
 场景/设定：${chat.scene || '日常闲聊'}
@@ -4194,6 +4195,91 @@ function renderStickerGrid() {
   }
 }
 
+function cleanStickerName(v, fallback) {
+  const s = String(v || '').replace(/[\[\]\r\n\t]/g, ' ').replace(/\s+/g, ' ').trim();
+  return [...s].slice(0, STICKER_NAME_MAX).join('') || fallback || '表情';
+}
+
+const STICKER_MIME = { png: 'image/png', gif: 'image/gif', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp' };
+
+function parseZipEntries(buf) {
+  const dv = new DataView(buf);
+  const u8 = new Uint8Array(buf);
+  let eocd = -1;
+  for (let i = u8.length - 22, min = Math.max(0, u8.length - 65557); i >= min; i--) {
+    if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) throw new Error('不是有效的 zip 文件');
+  const count = dv.getUint16(eocd + 10, true);
+  const cdOffset = dv.getUint32(eocd + 16, true);
+  if (cdOffset === 0xFFFFFFFF) throw new Error('暂不支持 ZIP64 压缩包');
+  const entries = [];
+  let p = cdOffset;
+  for (let i = 0; i < count; i++) {
+    if (dv.getUint32(p, true) !== 0x02014b50) break;
+    const method = dv.getUint16(p + 10, true);
+    const compSize = dv.getUint32(p + 20, true);
+    const nameLen = dv.getUint16(p + 28, true);
+    const extraLen = dv.getUint16(p + 30, true);
+    const commentLen = dv.getUint16(p + 32, true);
+    const localOffset = dv.getUint32(p + 42, true);
+    if (compSize === 0xFFFFFFFF || localOffset === 0xFFFFFFFF) throw new Error('暂不支持 ZIP64 压缩包');
+    const name = new TextDecoder('utf-8').decode(u8.subarray(p + 46, p + 46 + nameLen));
+    entries.push({ name, method, compSize, localOffset });
+    p += 46 + nameLen + extraLen + commentLen;
+  }
+  return entries;
+}
+
+async function readZipEntry(buf, entry) {
+  const dv = new DataView(buf);
+  const p = entry.localOffset;
+  if (dv.getUint32(p, true) !== 0x04034b50) throw new Error('压缩包结构损坏');
+  const nameLen = dv.getUint16(p + 26, true);
+  const extraLen = dv.getUint16(p + 28, true);
+  const start = p + 30 + nameLen + extraLen;
+  const data = new Uint8Array(buf, start, entry.compSize);
+  if (entry.method === 0) return data.slice();
+  if (entry.method !== 8) throw new Error('不支持的压缩方式');
+  if (typeof DecompressionStream !== 'function') throw new Error('当前浏览器不支持解压');
+  const stream = new Blob([data]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+async function importStickerZip(file) {
+  const buf = await file.arrayBuffer();
+  const entries = parseZipEntries(buf);
+  const manifest = entries.find((e) => /(^|\/)custom_stickers\.json$/i.test(e.name));
+  const nameMap = new Map();
+  if (manifest) {
+    const raw = await readZipEntry(buf, manifest);
+    const list = JSON.parse(new TextDecoder('utf-8').decode(raw));
+    for (const it of (Array.isArray(list) ? list : [])) {
+      if (it?.fileName) nameMap.set(String(it.fileName), it.description || '');
+    }
+  }
+  const images = entries.filter((e) => /\.(png|gif|jpe?g|webp)$/i.test(e.name));
+  if (!images.length) throw new Error('压缩包里没有表情图片');
+  const existing = new Set((await idb.all('stickers')).map((s) => s.name));
+  let added = 0, skipped = 0;
+  for (let i = 0; i < images.length; i++) {
+    const e = images[i];
+    const base = e.name.split('/').pop();
+    const ext = (base.split('.').pop() || '').toLowerCase();
+    const name = cleanStickerName(nameMap.get(base) || nameMap.get(e.name) || base.replace(/\.[^.]+$/, ''));
+    if (existing.has(name)) { skipped++; continue; }
+    const bytes = await readZipEntry(buf, e);
+    const mime = STICKER_MIME[ext] || 'image/png';
+    await idb.put('stickers', { id: uid(), name, blob: new Blob([bytes], { type: mime }), mime, createdAt: Date.now() });
+    existing.add(name);
+    added++;
+    if ((i + 1) % 25 === 0) toast(`正在导入表情 ${i + 1}/${images.length}…`, 4000);
+  }
+  await loadChatStickers();
+  renderStickerGrid();
+  toast(`已导入 ${added} 个表情${skipped ? `，跳过重复 ${skipped} 个` : ''}`, 5000);
+}
+
 function bindChat() {
   $('btnNewGroup').addEventListener('click', openCreateGroup);
   $('btnChatBack').addEventListener('click', () => { renderChatLobby(); window.scrollTo(0, 0); });
@@ -4230,7 +4316,7 @@ function bindChat() {
     let n = 0;
     for (const f of files) {
       if (!/^image\//.test(f.type)) continue;
-      const name = (f.name.replace(/\.[^.]+$/, '') || '表情').trim().slice(0, 6) || '表情';
+      const name = cleanStickerName(f.name.replace(/\.[^.]+$/, ''), '表情');
       await idb.put('stickers', { id: uid(), name, blob: f, mime: f.type, createdAt: Date.now() });
       n++;
     }
@@ -4238,6 +4324,19 @@ function bindChat() {
     await loadChatStickers();
     renderStickerGrid();
     toast(`已添加 ${n} 个表情`);
+  });
+
+  $('btnStickerZip').addEventListener('click', () => $('stickerZipInput').click());
+  $('stickerZipInput').addEventListener('change', async (e) => {
+    const file = (e.target.files || [])[0];
+    e.target.value = '';
+    if (!file) return;
+    toast('正在读取表情包…', 6000);
+    try {
+      await importStickerZip(file);
+    } catch (err) {
+      toast('导入失败：' + (err.message || err), 6000);
+    }
   });
 
   $('chatModalClose').addEventListener('click', closeChatModal);

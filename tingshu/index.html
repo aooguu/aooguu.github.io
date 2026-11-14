@@ -149,10 +149,14 @@
   <div id="stickerPanel" class="sticker-panel" hidden>
     <div class="sticker-head">
       <span>表情包</span>
-      <button id="btnStickerAdd" class="mini-btn">＋ 添加图片</button>
+      <div class="sticker-actions">
+        <button id="btnStickerAdd" class="mini-btn">＋ 添加图片</button>
+        <button id="btnStickerZip" class="mini-btn">＋ 导入表情包</button>
+      </div>
     </div>
     <div id="stickerGrid" class="sticker-grid"></div>
     <input type="file" id="stickerInput" accept="image/*" multiple hidden>
+    <input type="file" id="stickerZipInput" accept=".zip,application/zip" hidden>
   </div>
   <div class="chat-composer">
     <button id="btnChatSticker" class="chat-tool" title="表情包">☺</button>
