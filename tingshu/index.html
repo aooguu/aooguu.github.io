@@ -128,7 +128,7 @@
       </div>
       <div id="chatGroupList" class="list"></div>
       <div id="chatEmpty" class="empty">还没有群。选几个角色，开一个群聊。</div>
-      <p class="hint">群里每个角色用角色卡里的音色说话；文字回复由 AI 生成，语音条点一下才合成。表情和录音只存在本机。</p>
+      <p class="hint">群里每个角色用角色卡里的音色说话；AI 按群设置发文字或语音，文字消息点「转语音」也能朗读。表情和录音只存在本机。</p>
     </div>
     <div id="chatThread" hidden>
       <div class="chat-head">
@@ -158,12 +158,38 @@
     <input type="file" id="stickerInput" accept="image/*" multiple hidden>
     <input type="file" id="stickerZipInput" accept=".zip,application/zip" hidden>
   </div>
+  <div id="chatQuoteBar" class="chat-quote-bar" hidden>
+    <div class="cq-main"><span class="cq-name"></span><span class="cq-text"></span></div>
+    <button id="cqClear" class="cq-clear" aria-label="取消引用">✕</button>
+  </div>
   <div class="chat-composer">
-    <button id="btnChatMic" class="chat-tool" title="语音">🎙</button>
+    <button id="btnChatMic" class="chat-tool" title="语音" aria-label="语音">
+      <svg class="ic-mic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+        <circle cx="12" cy="12" r="8.4"/>
+        <path d="M8.4 10.2v3.6M12 7.6v8.8M15.6 10.2v3.6"/>
+      </svg>
+      <svg class="ic-kb" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="3.4" y="6.2" width="17.2" height="11.6" rx="2.4"/>
+        <path d="M7 10h.01M10.4 10h.01M13.8 10h.01M17.2 10h.01M8.2 13.6h7.6"/>
+      </svg>
+    </button>
     <textarea id="chatInput" rows="1" placeholder="说点什么…"></textarea>
     <button id="btnChatHold" class="chat-hold" hidden>按住 说话</button>
-    <button id="btnChatSticker" class="chat-tool" title="表情包">☺</button>
+    <button id="btnChatSticker" class="chat-tool" title="表情包" aria-label="表情">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+        <circle cx="12" cy="12" r="8.4"/>
+        <path d="M8.4 13.8c.9 1.3 2.1 2 3.6 2s2.7-.7 3.6-2"/>
+        <path d="M9.2 9.8h.01M14.8 9.8h.01"/>
+      </svg>
+    </button>
     <button id="btnChatSend" class="chat-send">发送</button>
+  </div>
+</div>
+
+<div id="chatRecOverlay" hidden>
+  <div class="rec-panel">
+    <div class="rec-wave"><i></i><i></i><i></i><i></i><i></i></div>
+    <div id="recHint" class="rec-hint">松开 结束</div>
   </div>
 </div>
 
@@ -195,17 +221,39 @@
   </div>
 </div>
 
-<footer id="playerBar" hidden>
-  <div class="pb-main" id="pbMain">
-    <div class="pb-title" id="pbTitle">—</div>
-    <div class="pb-sub" id="pbSub">—</div>
-  </div>
-  <div class="pb-controls">
-    <button id="btnPrev" class="pb-btn" title="上一段">⏮</button>
-    <button id="btnPlay" class="pb-btn play" title="播放">▶</button>
-    <button id="btnNext" class="pb-btn" title="下一段">⏭</button>
-  </div>
-</footer>
+<button id="playerBall" class="player-ball" hidden aria-label="AI 阅读" title="AI 阅读">
+  <span id="pbRing" class="pb-ring"></span>
+  <span class="pb-note">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M9.2 17.6V6.6l8.6-1.9v10.8"/>
+      <circle cx="6.5" cy="18" r="2.6" fill="currentColor" stroke="none"/>
+      <circle cx="15.1" cy="15.6" r="2.6" fill="currentColor" stroke="none"/>
+    </svg>
+  </span>
+</button>
+
+<div id="playerPanel" class="player-panel" hidden>
+  <span class="pp-note" aria-hidden="true">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M9.2 17.6V6.6l8.6-1.9v10.8"/>
+      <circle cx="6.5" cy="18" r="2.6" fill="currentColor" stroke="none"/>
+      <circle cx="15.1" cy="15.6" r="2.6" fill="currentColor" stroke="none"/>
+    </svg>
+  </span>
+  <div class="pp-title" id="ppTitle">—</div>
+  <button id="ppPlay" class="pp-btn pp-play" aria-label="播放"></button>
+  <button id="ppNext" class="pp-btn" aria-label="下一段">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M17.5 5.5v13"/><path d="M6 6.5l7.5 5.5L6 17.5z"/></svg>
+  </button>
+  <button id="ppClose" class="pp-btn pp-close" aria-label="收起">✕</button>
+</div>
+
+<div id="msgMenu" class="msg-menu" hidden>
+  <button data-act="quote">引用</button>
+  <button data-act="copy">复制</button>
+  <button data-act="del">删除</button>
+  <button data-act="tts">转语音</button>
+</div>
 
 <nav id="tabbar">
   <button class="tab active" data-nav="shelf"><span>▤</span>书架</button>

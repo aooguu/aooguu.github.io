@@ -3,7 +3,7 @@
 const DEFAULT_BASE = 'https://api.xiaomimimo.com/v1';
 const AI_DEFAULT_BASE = 'https://api.deepseek.com/v1';
 const AI_DEFAULT_MODEL = 'deepseek-chat';
-const APP_VER = 'v21';
+const APP_VER = 'v27';
 const VOICES = [
   { id: '冰糖', label: '冰糖 · 中文女声' },
   { id: '茉莉', label: '茉莉 · 中文女声' },
@@ -1307,7 +1307,7 @@ async function playIndex(i) {
   if (i >= chapterSegments.length) { toast('本章已播完'); stopPlayback(); return; }
   const token = ++playToken;
   setCurrent(i);
-  $('btnPlay').innerHTML = '<span class="spin"></span>';
+  $('playerBall')?.classList.add('loading');
   try {
     if (!urlCache.has(i) && !inflight.has(i)) prefetch(i);
     const url = await (inflight.has(i) ? inflight.get(i) : Promise.resolve(null));
@@ -1334,8 +1334,20 @@ async function playIndex(i) {
   }
 }
 
+const PP_PLAY_SVG = '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5.5v13l11-6.5z"/></svg>';
+const PP_PAUSE_SVG = '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6.5" y="5.5" width="3.6" height="13" rx="1"/><rect x="13.9" y="5.5" width="3.6" height="13" rx="1"/></svg>';
+
 function updatePlayBtn() {
-  $('btnPlay').textContent = playing ? '⏸' : '▶';
+  const ball = $('playerBall');
+  if (ball) {
+    ball.classList.remove('loading');
+    ball.classList.toggle('playing', playing);
+  }
+  const pp = $('ppPlay');
+  if (pp) {
+    pp.innerHTML = playing ? PP_PAUSE_SVG : PP_PLAY_SVG;
+    pp.setAttribute('aria-label', playing ? '暂停' : '播放');
+  }
 }
 
 function stopPlayback() {
@@ -1514,8 +1526,8 @@ async function openBook(id) {
   updatePlayerBar();
   showView('book');
   aiNudgeCheck();
-  $('playerBar').hidden = false;
-  document.body.classList.add('has-player');
+  $('playerBall').hidden = false;
+  setPlayerPanel(false);
 }
 
 function renderBookHeader() {
@@ -1747,6 +1759,8 @@ function reanalyzeBook() {
   toast(`已重新分析：${a.names.length} 个角色${a.firstPerson ? ' · 第一人称' : ''}`);
 }
 
+const castExpanded = new Set();
+
 function renderCast() {
   const panel = $('castPanel');
   const rows = castList();
@@ -1765,21 +1779,28 @@ function renderCast() {
         <button class="mini-btn" id="btnAddCast">＋ 角色</button>
       </span>
     </div>
-    <div class="cast-row" data-name="旁白">
-      <div class="cast-top">
-        <input class="cast-name" value="旁白" readonly>
+    <div class="cast-row${castExpanded.has('旁白') ? ' open' : ''}" data-name="旁白">
+      <div class="cast-summary">
+        <span class="cast-title">旁白</span>
         <span class="cast-count">${fp ? `叙述 · 用${book.protagonist}的声音` : '叙述'}</span>
+        <span class="cast-voice-chip">${escapeAttr(narrator.voice || '默认')}</span>
+        <span class="cast-caret" aria-hidden="true">›</span>
       </div>
-      <div class="cast-grid">
-        <select class="cast-voice">${voiceOptions(narrator.voice)}</select>
-        <input class="cast-style" placeholder="语气指令（可留空）" value="${escapeAttr(narrator.style || '')}">
-        <button class="mini-btn cast-preview">试听</button>
+      <div class="cast-edit">
+        <div class="cast-top">
+          <input class="cast-name" value="旁白" readonly>
+        </div>
+        <div class="cast-grid">
+          <select class="cast-voice">${voiceOptions(narrator.voice)}</select>
+          <input class="cast-style" placeholder="语气指令（可留空）" value="${escapeAttr(narrator.style || '')}">
+          <button class="mini-btn cast-preview">试听</button>
+        </div>
+        ${fp
+          ? `<div class="clone-row"><span class="clone-info">旁白沿用主角「${escapeAttr(book.protagonist)}」的克隆音色（在主角卡设置）</span></div>`
+          : cloneRowHtml(narrator)}
+        ${fp ? '' : `<input class="cast-desc cast-desc-main" placeholder="音色描述（含年龄），如：三十岁女性，声音清亮，语速适中" value="${escapeAttr(narrator.voiceDesc || '')}">`}
+        <input class="cast-tags cast-tags-main" placeholder="风格标签，如：平稳 语速适中" value="${escapeAttr(entryTags(narrator))}">
       </div>
-      ${fp
-        ? `<div class="clone-row"><span class="clone-info">旁白沿用主角「${escapeAttr(book.protagonist)}」的克隆音色（在主角卡设置）</span></div>`
-        : cloneRowHtml(narrator)}
-      ${fp ? '' : `<input class="cast-desc cast-desc-main" placeholder="音色描述（含年龄），如：三十岁女性，声音清亮，语速适中" value="${escapeAttr(narrator.voiceDesc || '')}">`}
-      <input class="cast-tags cast-tags-main" placeholder="风格标签，如：平稳 语速适中" value="${escapeAttr(entryTags(narrator))}">
     </div>
     ${rows.map(([name, info]) => {
       const e = castEntryFor(name);
@@ -1799,33 +1820,48 @@ function renderCast() {
             </div>
           </div>`).join('')}
       </div>` : '';
-      return `<div class="cast-row" data-name="${escapeAttr(name)}">
-        <div class="cast-top">
-          <input class="cast-name" value="${escapeAttr(name)}">
-          <button class="gchip g-${g}" title="点击切换性别">${genderLabel(g)}</button>
+      return `<div class="cast-row${castExpanded.has(name) ? ' open' : ''}" data-name="${escapeAttr(name)}">
+        <div class="cast-summary">
+          <span class="cast-title">${escapeAttr(name)}</span>
+          <span class="gchip g-${g} cast-g">${genderLabel(g)}</span>
           <span class="cast-count">${info.count || 0} 句${staged ? ` · ${e.stages.length} 个阶段` : ''}</span>
+          <span class="cast-voice-chip">${escapeAttr(e.voice || '默认')}</span>
+          <span class="cast-caret" aria-hidden="true">›</span>
         </div>
-        <div class="cast-grid">
-          <select class="cast-voice">${voiceOptions(e.voice)}</select>
-          <input class="cast-style" placeholder="语气指令（可留空）" value="${escapeAttr(e.style || '')}">
-          <button class="mini-btn cast-preview">试听</button>
+        <div class="cast-edit">
+          <div class="cast-top">
+            <input class="cast-name" value="${escapeAttr(name)}">
+            <button class="gchip g-${g}" title="点击切换性别">${genderLabel(g)}</button>
+          </div>
+          <div class="cast-grid">
+            <select class="cast-voice">${voiceOptions(e.voice)}</select>
+            <input class="cast-style" placeholder="语气指令（可留空）" value="${escapeAttr(e.style || '')}">
+            <button class="mini-btn cast-preview">试听</button>
+          </div>
+          ${cloneRowHtml(e)}
+          ${staged ? '' : `<input class="cast-desc cast-desc-main" placeholder="音色描述（含年龄），如：四十岁男性，声音低沉沙哑，语速缓慢" value="${escapeAttr(e.voiceDesc || '')}">`}
+          ${staged ? '' : `<input class="cast-tags cast-tags-main" placeholder="风格标签，如：磁性 低沉 语速缓慢" title="${escapeAttr(e.voiceDesc || '')}" value="${escapeAttr(entryTags(e))}">`}
+          ${stageHtml}
         </div>
-        ${cloneRowHtml(e)}
-        ${staged ? '' : `<input class="cast-desc cast-desc-main" placeholder="音色描述（含年龄），如：四十岁男性，声音低沉沙哑，语速缓慢" value="${escapeAttr(e.voiceDesc || '')}">`}
-        ${staged ? '' : `<input class="cast-tags cast-tags-main" placeholder="风格标签，如：磁性 低沉 语速缓慢" title="${escapeAttr(e.voiceDesc || '')}" value="${escapeAttr(entryTags(e))}">`}
-        ${stageHtml}
       </div>`;
     }).join('')}
         <p class="cast-note">${fp ? `第一人称：旁白和对白里的“我”都按主角「${escapeAttr(book.protagonist)}」处理。` : ''}性别和语气由全书统计推断，可点 ? 修改；改名字会把同名的话合并。AI 解析按批推进（每批约 ${(AI_WINDOW_CHARS / 10000).toFixed(0)} 万字），会按章记录角色的年龄阶段；同一时期只保留一套标签，不会因为描述措辞不同反复换声。听到离本批结尾约 ${(AI_NUDGE_CHARS / 10000).toFixed(0)} 万字时会提醒继续解析。开始 AI 解析后，这里只显示已解析章节里确认出场的角色；后面还没出场的角色，会在继续解析时自动加入。<br>「音色描述」会原样作为角色卡片发给模型，年龄写在这里最稳；改动后该角色的音频会重新合成。播放时默认用基础模型实时合成，标签直接控制音色和语气；勾选「用克隆音色」的角色会改用克隆模型，每段随请求发送一次样本，逐句 AI 语气标签照常生效。标签留空会按音色描述自动推导；短词如「沙哑」「苍老」「语速缓慢」比长句更稳定，最多 6 个，用空格分隔。</p>`;
 
   panel.querySelectorAll('.cast-row').forEach(row => {
     const name = row.dataset.name;
+    row.querySelector('.cast-summary').addEventListener('click', () => {
+      const open = !row.classList.contains('open');
+      row.classList.toggle('open', open);
+      if (open) castExpanded.add(name); else castExpanded.delete(name);
+    });
     row.querySelector('.cast-voice').addEventListener('change', (e) => {
       const entry = castEntryFor(name);
       entry.manual = true;
       const v = e.target.value;
       entry.voice = v;
       if (entry.stages) for (const st of entry.stages) st.voice = v;
+      const chip = row.querySelector('.cast-voice-chip');
+      if (chip) chip.textContent = v;
       saveBookSoon();
       clearUrlCache();
     });
@@ -1979,7 +2015,7 @@ function renderCast() {
       if (!newName || newName === name) { e.target.value = name; return; }
       renameSpeaker(name, newName);
     });
-    const gc = row.querySelector('.gchip');
+    const gc = row.querySelector('.cast-edit .gchip');
     if (gc) {
       gc.addEventListener('click', () => {
         const cur = book.cast[name]?.gender || '?';
@@ -2162,10 +2198,8 @@ function scrollSegIntoView(el) {
   const vh = window.visualViewport ? window.visualViewport.height : window.innerHeight;
   const topbar = $('topbar');
   const top = (topbar ? topbar.getBoundingClientRect().bottom : 0) + 10;
-  const pb = $('playerBar');
   const tab = $('tabbar');
-  const overlays = (pb && !pb.hidden ? pb.getBoundingClientRect().height : 0)
-    + (tab ? tab.getBoundingClientRect().height : 0);
+  const overlays = tab ? tab.getBoundingClientRect().height : 0;
   const bottom = vh - overlays - 12;
   const rect = el.getBoundingClientRect();
   if (rect.top >= top && rect.bottom <= bottom) return;
@@ -2183,16 +2217,55 @@ function renderSegHighlight() {
   if (cur) scrollSegIntoView(cur);
 }
 
+let playerPanelOpen = false;
+
+function placePlayerPanel() {
+  const ball = $('playerBall');
+  const panel = $('playerPanel');
+  if (!ball || !panel || panel.hidden) return;
+  const br = ball.getBoundingClientRect();
+  const pw = panel.offsetWidth;
+  const ph = panel.offsetHeight;
+  let left = br.left + br.width / 2 - pw / 2;
+  left = Math.max(8, Math.min(left, window.innerWidth - pw - 8));
+  let top = br.top - ph - 10;
+  if (top < 8) top = Math.min(window.innerHeight - ph - 8, br.bottom + 10);
+  panel.style.left = left + 'px';
+  panel.style.top = Math.max(8, top) + 'px';
+}
+
+function setPlayerPanel(open) {
+  playerPanelOpen = !!open;
+  const panel = $('playerPanel');
+  if (!panel) return;
+  panel.hidden = !playerPanelOpen;
+  const ball = $('playerBall');
+  if (ball) {
+    ball.classList.toggle('open', playerPanelOpen);
+    ball.setAttribute('aria-label', playerPanelOpen ? '收起阅读控制' : 'AI 阅读');
+  }
+  if (playerPanelOpen) {
+    updatePlayerBar();
+    updatePlayBtn();
+    placePlayerPanel();
+  }
+}
+
 function updatePlayerBar() {
   if (!book) return;
-  $('pbTitle').textContent = book.title;
+  const ball = $('playerBall');
+  if (!ball) return;
   const seg = chapterSegments[currentSeg];
   const ch = book.chapters[chapterIdx];
-  $('pbSub').textContent = seg
-    ? `${ch.title} · ${seg.speaker} ${currentSeg + 1}/${chapterSegments.length}`
-    : `${ch.title} · ${chapterSegments.length} 段`;
-  $('btnPrev').disabled = currentSeg <= 0;
-  $('btnNext').disabled = currentSeg >= chapterSegments.length - 1;
+  ball.title = seg
+    ? `${book.title} · ${ch.title} · ${seg.speaker} ${currentSeg + 1}/${chapterSegments.length}`
+    : `${book.title} · ${ch.title} · ${chapterSegments.length} 段`;
+  const pct = chapterSegments.length ? Math.round(((currentSeg + 1) / chapterSegments.length) * 100) : 0;
+  const ring = $('pbRing');
+  if (ring) ring.style.background = `conic-gradient(rgba(61,220,132,.95) ${pct}%, rgba(61,220,132,.16) 0)`;
+  const ppTitle = $('ppTitle');
+  if (ppTitle) ppTitle.textContent = `${book.title} · ${ch.title}`;
+  if (playerPanelOpen) placePlayerPanel();
 }
 
 /* ---------------- 导出 ---------------- */
@@ -3406,7 +3479,77 @@ function bind() {
     else { showView('settings'); renderSettings(); }
   });
 
-  $('pbMain').addEventListener('click', () => { if (book) { showView('player'); renderSegHighlight(); } });
+  const ball = $('playerBall');
+  let ballDrag = null;
+  let ballSuppressClick = false;
+  const BALL_SIZE = 44;
+  const placeBall = (x, y) => {
+    const px = Math.min(Math.max(6, x), window.innerWidth - BALL_SIZE - 6);
+    const py = Math.min(Math.max(6, y), window.innerHeight - BALL_SIZE - 6);
+    ball.style.left = px + 'px';
+    ball.style.top = py + 'px';
+    ball.style.right = 'auto';
+    ball.style.bottom = 'auto';
+    return { x: px, y: py };
+  };
+  const saveBallPos = (x, y) => {
+    try { localStorage.setItem('tts.ballPos', JSON.stringify({ x, y })); } catch {}
+  };
+  try {
+    const saved = JSON.parse(localStorage.getItem('tts.ballPos') || 'null');
+    if (saved && Number.isFinite(saved.x) && Number.isFinite(saved.y)) {
+      placeBall(saved.x, saved.y);
+    }
+  } catch {}
+  ball.addEventListener('pointerdown', (e) => {
+    if (e.button != null && e.button !== 0) return;
+    const r = ball.getBoundingClientRect();
+    ballDrag = { id: e.pointerId, ox: e.clientX - r.left, oy: e.clientY - r.top, moved: false, x: r.left, y: r.top };
+    try { ball.setPointerCapture(e.pointerId); } catch {}
+  });
+  ball.addEventListener('pointermove', (e) => {
+    if (!ballDrag || e.pointerId !== ballDrag.id) return;
+    const nx = e.clientX - ballDrag.ox;
+    const ny = e.clientY - ballDrag.oy;
+    if (!ballDrag.moved && Math.hypot(nx - ballDrag.x, ny - ballDrag.y) > 4) ballDrag.moved = true;
+    if (ballDrag.moved) {
+      const p = placeBall(nx, ny);
+      ballDrag.x = p.x;
+      ballDrag.y = p.y;
+      if (playerPanelOpen) placePlayerPanel();
+    }
+  });
+  const endBallDrag = (e) => {
+    if (!ballDrag || e.pointerId !== ballDrag.id) return;
+    const moved = ballDrag.moved;
+    ballDrag = null;
+    if (moved) {
+      const r = ball.getBoundingClientRect();
+      saveBallPos(r.left, r.top);
+      if (playerPanelOpen) placePlayerPanel();
+      ballSuppressClick = true;
+      setTimeout(() => { ballSuppressClick = false; }, 350);
+    }
+  };
+  ball.addEventListener('pointerup', endBallDrag);
+  ball.addEventListener('pointercancel', endBallDrag);
+  ball.addEventListener('click', (e) => {
+    e.preventDefault();
+    if (ballSuppressClick) { ballSuppressClick = false; return; }
+    setPlayerPanel(!playerPanelOpen);
+  });
+  $('ppClose').addEventListener('click', () => setPlayerPanel(false));
+  $('ppPlay').addEventListener('click', togglePlay);
+  $('ppNext').addEventListener('click', () => playIndex(currentSeg + 1));
+  window.addEventListener('resize', () => {
+    if (ball.style.left) {
+      const r = ball.getBoundingClientRect();
+      const p = placeBall(r.left, r.top);
+      saveBallPos(p.x, p.y);
+    }
+    if (playerPanelOpen) placePlayerPanel();
+  });
+
   const segListEl = $('segList');
   segListEl.addEventListener('touchstart', (e) => {
     if (e.touches.length !== 1) { segTouchStart = null; return; }
@@ -3438,10 +3581,6 @@ function bind() {
     if (currentView !== 'player') showView('player');
     playIndex(i);
   });
-  $('btnPlay').addEventListener('click', togglePlay);
-  $('btnPrev').addEventListener('click', () => playIndex(currentSeg - 1));
-  $('btnNext').addEventListener('click', () => playIndex(currentSeg + 1));
-
   $('btnSaveSettings').addEventListener('click', () => {
     saveSettings({
       apiKey: $('apiKey').value.trim(),
@@ -3558,7 +3697,11 @@ let chatVoiceDraft = null;
 let chatModalApplyFn = null;
 let chatVoiceMode = false;
 let chatHoldActive = false;
-let chatRecTimer = 0;
+let chatHoldStartY = 0;
+let chatHoldCancel = false;
+let chatQuote = null;
+let msgMenuMsg = null;
+const CHAT_VOICE_SVG = '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4.6 9.4h2.7l3.4-3.1v11.4l-3.4-3.1H4.6z" fill="currentColor"/><path class="cv-w1" d="M13.4 9a4.6 4.6 0 010 6" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><path class="cv-w2" d="M16.6 6.6a8.2 8.2 0 010 10.8" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg>';
 
 function chatSaveSoon() {
   if (!chat) return;
@@ -3597,6 +3740,10 @@ function loadStickerImg(id, img) {
 async function renderChatLobby() {
   chatCancelRecording();
   if (chatAudio && !chatAudio.paused) chatAudio.pause();
+  chatSettlePending();
+  chatHideMsgMenu();
+  chatQuote = null;
+  chatRenderQuoteBar();
   chat = null;
   chatReplyToken++;
   chatBusy = false;
@@ -3626,6 +3773,7 @@ async function renderChatLobby() {
       if (last.type === 'sys') preview = last.text || '';
       else if (last.type === 'sticker') preview = `${last.role === 'user' ? '我' : last.speaker}发了一个表情`;
       else if (last.type === 'uservoice') preview = `我：${last.text || '[语音]'}`;
+      else if (last.type === 'voice') preview = `${last.speaker}：[语音]`;
       else preview = `${last.role === 'user' ? '我' : last.speaker}：${last.text || ''}`;
     }
     item.innerHTML = `
@@ -3648,7 +3796,11 @@ async function openChatGroup(id) {
   if (chatAudio && !chatAudio.paused) chatAudio.pause();
   chat = c;
   if (!Array.isArray(chat.messages)) chat.messages = [];
+  chatSettlePending();
   chatNormalizeStickerText();
+  chatHideMsgMenu();
+  chatQuote = null;
+  chatRenderQuoteBar();
   chatReplyToken++;
   chatBusy = false;
   $('chatTyping').hidden = true;
@@ -3748,35 +3900,161 @@ function chatMsgEl(m, showName) {
       bubble.appendChild(img);
     } else bubble.textContent = m.sticker ? `[${m.sticker}]` : '🙂';
   } else if (m.type === 'uservoice' || m.type === 'voice') {
+    bubble.classList.add('cvoice-bubble');
     const v = document.createElement('div');
     v.className = 'cvoice';
+    const pend = m.type === 'voice' && m.pending && !m.mediaId;
     const secs = Math.max(1, Math.round(m.dur || 1));
-    v.style.width = Math.min(220, 70 + secs * 6) + 'px';
-    v.innerHTML = '<span class="cplay">🔊</span><span class="cwave">▁▂▃▂▁</span><span class="cdur"></span>';
-    v.querySelector('.cdur').textContent = m.dur ? `${secs}″` : '';
-    v.addEventListener('click', (e) => { e.stopPropagation(); chatPlayVoiceMsg(m, v); });
-    bubble.appendChild(v);
-    if (m.text) {
-      const t = document.createElement('div');
-      t.className = 'cvoice-text';
-      t.textContent = m.text;
-      bubble.appendChild(t);
+    v.style.width = (pend ? 132 : Math.min(210, 86 + Math.min(secs, 30) * 4)) + 'px';
+    v.innerHTML = CHAT_VOICE_SVG + (pend
+      ? '<span class="cdur cwait">合成中…</span>'
+      : `<span class="cdur">${secs}″</span>`);
+    if (pend) {
+      v.classList.add('pending');
+      v.addEventListener('click', (e) => { e.stopPropagation(); toast('语音还在合成，稍等一下'); });
+    } else {
+      v.addEventListener('click', (e) => { e.stopPropagation(); chatPlayVoiceMsg(m, v); });
     }
+    bubble.appendChild(v);
   } else {
-    bubble.textContent = m.text || '';
+    if (m.quote) {
+      const q = document.createElement('div');
+      q.className = 'cquote';
+      const qn = document.createElement('span');
+      qn.className = 'cq-n';
+      qn.textContent = `${m.quote.speaker}：`;
+      q.appendChild(qn);
+      q.appendChild(document.createTextNode(m.quote.text || ''));
+      bubble.appendChild(q);
+    }
+    bubble.appendChild(document.createTextNode(m.text || ''));
   }
-  if (m.role === 'char' && m.type === 'text' && m.text) {
-    const vb = document.createElement('button');
-    vb.className = 'cvoice-hint';
-    vb.textContent = '🔊 语音';
-    vb.title = '用角色音色读出来';
-    vb.addEventListener('click', (e) => { e.stopPropagation(); chatPlayTextTTS(m, vb); });
-    bubble.appendChild(vb);
+  if (m.role === 'char' && m.text && m.type !== 'sticker' && m.type !== 'voice' && m.type !== 'uservoice' && m.type !== 'sys') {
+    chatLongPress(bubble, () => chatShowMsgMenu(m, bubble));
   }
   body.appendChild(bubble);
   el.appendChild(av);
   el.appendChild(body);
   return el;
+}
+
+function chatRefreshMsg(m) {
+  const box = $('chatMsgs');
+  const old = box?.querySelector(`.cmsg[data-mid="${m.id}"]`);
+  if (!old) return;
+  const near = window.innerHeight + window.scrollY >= document.body.scrollHeight - 200;
+  old.replaceWith(chatMsgEl(m, true));
+  if (near) window.scrollTo(0, document.body.scrollHeight);
+}
+
+function chatSettlePending() {
+  if (!chat?.messages) return;
+  let changed = false;
+  for (const m of chat.messages) {
+    if (m.pending) { m.type = 'text'; delete m.pending; changed = true; }
+  }
+  if (changed) chatSaveSoon();
+}
+
+function chatCopyText(text) {
+  const s = String(text || '');
+  const fallback = () => {
+    const ta = document.createElement('textarea');
+    ta.value = s;
+    ta.style.cssText = 'position:fixed;left:-9999px;top:0;opacity:0';
+    document.body.appendChild(ta);
+    ta.select();
+    let ok = false;
+    try { ok = document.execCommand('copy'); } catch {}
+    ta.remove();
+    toast(ok ? '已复制' : '复制失败');
+  };
+  if (navigator.clipboard?.writeText) navigator.clipboard.writeText(s).then(() => toast('已复制'), fallback);
+  else fallback();
+}
+
+function chatDeleteMsg(m) {
+  if (!chat) return;
+  const i = chat.messages.indexOf(m);
+  if (i < 0) return;
+  chat.messages.splice(i, 1);
+  chat.updatedAt = Date.now();
+  chatSaveSoon();
+  renderChatMessages();
+  toast('已删除');
+}
+
+function chatRenderQuoteBar() {
+  const bar = $('chatQuoteBar');
+  if (!bar) return;
+  bar.hidden = !chatQuote;
+  if (!chatQuote) return;
+  bar.querySelector('.cq-name').textContent = chatQuote.speaker + '：';
+  bar.querySelector('.cq-text').textContent = chatQuote.text;
+}
+
+function chatSetQuote(m) {
+  chatQuote = { speaker: m.role === 'user' ? '我' : m.speaker, text: String(m.text || '') };
+  chatRenderQuoteBar();
+  if (chatVoiceMode) setChatVoiceMode(false);
+  $('chatInput').focus();
+}
+
+function chatMenuOutside(e) {
+  const menu = $('msgMenu');
+  if (menu && !menu.contains(e.target)) chatHideMsgMenu();
+}
+
+function chatHideMsgMenu() {
+  const menu = $('msgMenu');
+  if (!menu || menu.hidden) return;
+  menu.hidden = true;
+  msgMenuMsg = null;
+  document.removeEventListener('pointerdown', chatMenuOutside, true);
+  window.removeEventListener('scroll', chatHideMsgMenu, true);
+  window.removeEventListener('resize', chatHideMsgMenu);
+}
+
+function chatShowMsgMenu(m, bubble) {
+  const menu = $('msgMenu');
+  if (!menu) return;
+  msgMenuMsg = m;
+  menu.hidden = false;
+  menu.style.left = '0px';
+  menu.style.top = '0px';
+  const r = bubble.getBoundingClientRect();
+  const mw = menu.offsetWidth;
+  const mh = menu.offsetHeight;
+  let left = r.left + r.width / 2 - mw / 2;
+  left = Math.max(6, Math.min(left, window.innerWidth - mw - 6));
+  let top = r.top - mh - 8;
+  if (top < 6) top = Math.min(window.innerHeight - mh - 6, r.bottom + 8);
+  menu.style.left = left + 'px';
+  menu.style.top = top + 'px';
+  document.addEventListener('pointerdown', chatMenuOutside, true);
+  window.addEventListener('scroll', chatHideMsgMenu, true);
+  window.addEventListener('resize', chatHideMsgMenu);
+}
+
+function chatLongPress(el, fn) {
+  let timer = null;
+  let sx = 0;
+  let sy = 0;
+  const clear = () => { if (timer) { clearTimeout(timer); timer = null; } };
+  el.addEventListener('pointerdown', (e) => {
+    if (e.button != null && e.button !== 0) return;
+    sx = e.clientX;
+    sy = e.clientY;
+    clear();
+    timer = setTimeout(() => { timer = null; fn(); }, 480);
+  });
+  el.addEventListener('pointermove', (e) => {
+    if (timer && Math.hypot(e.clientX - sx, e.clientY - sy) > 8) clear();
+  });
+  el.addEventListener('pointerup', clear);
+  el.addEventListener('pointercancel', clear);
+  el.addEventListener('pointerleave', clear);
+  el.addEventListener('contextmenu', (e) => { e.preventDefault(); clear(); fn(); });
 }
 
 function chatPush(msg) {
@@ -3841,7 +4119,7 @@ async function chatTTSBlob(m) {
   tags = entry ? stageTags(null, entry) : '';
   card = entry ? speechCard(entry, null) : '';
   const blob = await requestTTS(m.text, voice, tags, card, undefined, cloneUri);
-  const dur = Math.round(await audioDuration(blob));
+  const dur = Math.max(1, Math.round(await audioDuration(blob)));
   const id = uid();
   await idb.put('chatMedia', { id, chatId, kind: 'voice', blob, createdAt: Date.now() });
   m.mediaId = id;
@@ -3851,15 +4129,19 @@ async function chatTTSBlob(m) {
 }
 
 async function chatPlayTextTTS(m, btn) {
-  const old = btn.textContent;
-  btn.disabled = true;
-  btn.textContent = '合成中…';
+  const old = btn?.textContent;
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = '合成中…';
+  } else {
+    toast('正在合成…', 4000);
+  }
   try {
     const blob = await chatTTSBlob(m);
-    if (btn.isConnected) { btn.disabled = false; btn.textContent = old; }
+    if (btn?.isConnected) { btn.disabled = false; btn.textContent = old; }
     playChatBlob(blob);
   } catch (e) {
-    if (btn.isConnected) { btn.disabled = false; btn.textContent = old; }
+    if (btn?.isConnected) { btn.disabled = false; btn.textContent = old; }
     toast('语音生成失败：' + (e.message || e), 4000);
   }
 }
@@ -3870,8 +4152,14 @@ async function chatPlayVoiceMsg(m, el) {
   try {
     const rec = await idb.get('chatMedia', m.mediaId);
     if (!rec?.blob) { toast('语音数据不见了'); return; }
-    if (!m.dur) { m.dur = Math.round(await audioDuration(rec.blob)); chatSaveSoon(); }
+    if (!m.dur) { m.dur = Math.max(1, Math.round(await audioDuration(rec.blob))); chatSaveSoon(); }
     playChatBlob(rec.blob);
+    el.classList.add('playing');
+    if (chatAudio) {
+      const stop = () => el.classList.remove('playing');
+      chatAudio.addEventListener('ended', stop, { once: true });
+      chatAudio.addEventListener('pause', stop, { once: true });
+    }
   } finally {
     el.classList.remove('loading');
   }
@@ -3952,9 +4240,29 @@ function chatHistoryMessage() {
   const lines = recent.map((m) => {
     if (m.type === 'sticker') return `${m.role === 'user' ? '我' : m.speaker}：[${m.sticker}]`;
     if (m.type === 'uservoice') return `我：[语音] ${m.text || '（只发了语音）'}`;
-    return `${m.role === 'user' ? '我' : m.speaker}：${m.text || ''}`;
+    const q = m.quote ? `（引用 ${m.quote.speaker}：${m.quote.text}）` : '';
+    return `${m.role === 'user' ? '我' : m.speaker}：${q}${m.text || ''}`;
   });
   return `最近的聊天记录：\n${lines.join('\n')}\n\n请继续群聊，只输出 JSON。`;
+}
+
+function chatReplyMode() {
+  return chat?.replyMode === 'text' || chat?.replyMode === 'voice' ? chat.replyMode : 'mix';
+}
+function chatWantVoice() {
+  const mode = chatReplyMode();
+  return mode === 'voice' || (mode === 'mix' && Math.random() < 0.25);
+}
+function chatReplyModeField(current) {
+  const cur = current || 'mix';
+  return `<div class="chat-field"><span>AI 回复方式</span><div class="chat-modes">
+    <label><input type="radio" name="chatReplyMode" value="text"${cur === 'text' ? ' checked' : ''}> 文字</label>
+    <label><input type="radio" name="chatReplyMode" value="mix"${cur === 'mix' ? ' checked' : ''}> 文字为主</label>
+    <label><input type="radio" name="chatReplyMode" value="voice"${cur === 'voice' ? ' checked' : ''}> 语音</label>
+  </div></div>`;
+}
+function chatPickedReplyMode() {
+  return document.querySelector('input[name="chatReplyMode"]:checked')?.value || 'mix';
 }
 
 async function chatAskAi() {
@@ -4000,12 +4308,40 @@ async function chatAskAi() {
       chatPush({ role: 'char', type: 'sys', text: '（AI 这次没有接话，再发一句试试）' });
       return;
     }
-    for (let k = 0; k < replies.length; k++) {
+    const plans = replies.map((r) => {
+      const ex = chatExtractStickers(r.text);
+      const voice = !!(ex.text && chatWantVoice());
+      return { r, ex, voice, vm: voice ? { speaker: r.speaker, text: ex.text } : null };
+    });
+    for (const p of plans) {
+      if (!p.voice) continue;
+      p.job = chatTTSBlob(p.vm).then(() => true, () => false);
+    }
+    for (let k = 0; k < plans.length; k++) {
       await new Promise((r) => setTimeout(r, k === 0 ? 350 : 600 + Math.random() * 600));
       if (token !== chatReplyToken || !chat || chat.id !== chatId) return;
-      const r = replies[k];
-      const ex = chatExtractStickers(r.text);
-      if (ex.text) chatPush({ role: 'char', speaker: r.speaker, type: 'text', text: ex.text });
+      const { r, ex, voice, vm, job } = plans[k];
+      if (voice) {
+        const m = chatPush({ role: 'char', speaker: r.speaker, type: 'voice', pending: true, text: ex.text });
+        if (m) job.then((ok) => {
+          if (!chat || chat.id !== chatId || !chat.messages.includes(m)) {
+            if (vm.mediaId) idb.del('chatMedia', vm.mediaId).catch(() => {});
+            return;
+          }
+          if (ok && vm.mediaId) {
+            m.type = 'voice';
+            m.mediaId = vm.mediaId;
+            m.dur = vm.dur;
+          } else {
+            m.type = 'text';
+          }
+          delete m.pending;
+          chatSaveSoon();
+          chatRefreshMsg(m);
+        });
+      } else if (ex.text) {
+        chatPush({ role: 'char', speaker: r.speaker, type: 'text', text: ex.text });
+      }
       const extra = r.sticker && chatStickerMap.has(r.sticker) ? [r.sticker] : [];
       const stickers = [...new Set([...extra, ...ex.stickers])].slice(0, 2);
       for (const s of stickers) chatPush({ role: 'char', speaker: r.speaker, type: 'sticker', sticker: s });
@@ -4031,7 +4367,13 @@ async function chatSendText() {
   input.style.height = 'auto';
   $('stickerPanel').hidden = true;
   $('btnChatSticker').classList.remove('on');
-  chatPush({ role: 'user', type: 'text', text });
+  const msg = { role: 'user', type: 'text', text };
+  if (chatQuote) {
+    msg.quote = chatQuote;
+    chatQuote = null;
+    chatRenderQuoteBar();
+  }
+  chatPush(msg);
   await chatAskAi();
 }
 
@@ -4047,7 +4389,6 @@ function chatSendSticker(name) {
 function setChatVoiceMode(on) {
   chatVoiceMode = !!on;
   const mic = $('btnChatMic');
-  mic.textContent = chatVoiceMode ? '⌨' : '🎙';
   mic.title = chatVoiceMode ? '切换键盘' : '语音';
   mic.classList.toggle('on', chatVoiceMode);
   $('chatInput').hidden = chatVoiceMode;
@@ -4062,10 +4403,19 @@ function setChatVoiceMode(on) {
   }
 }
 
+function chatSetRecHint(cancel) {
+  const hint = $('recHint');
+  if (!hint) return;
+  hint.textContent = cancel ? '松开 取消' : '松开 发送';
+  hint.classList.toggle('cancel', !!cancel);
+}
+
 function chatResetRecUi() {
-  clearInterval(chatRecTimer);
   const hold = $('btnChatHold');
   if (hold) { hold.classList.remove('rec'); hold.textContent = '按住 说话'; }
+  const ov = $('chatRecOverlay');
+  if (ov) ov.hidden = true;
+  chatSetRecHint(false);
 }
 
 async function chatStartRecording() {
@@ -4101,11 +4451,10 @@ async function chatStartRecording() {
   rec.start();
   hold.classList.add('rec');
   hold.textContent = '松开 结束';
-  chatRecTimer = setInterval(() => {
-    if (!chatRecording) return;
-    const s = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
-    hold.textContent = `松开 结束 ${s}″`;
-  }, 500);
+  if (chatHoldActive) {
+    $('chatRecOverlay').hidden = false;
+    chatSetRecHint(false);
+  }
   if (!chatHoldActive) { try { rec.stop(); } catch {} }
 }
 
@@ -4168,16 +4517,18 @@ function openCreateGroup() {
     <div class="chat-field"><span>群名</span><input type="text" id="groupName" placeholder="例如：深夜便利店"></div>
     <div class="chat-field"><span>场景 / 设定（可选）</span><textarea id="groupScene" rows="2" placeholder="例如：三个人被困在雨夜的便利店，气氛微妙。"></textarea></div>
     <div class="chat-field"><span>成员</span><div class="chat-members" id="groupMembers">${checks}</div></div>
+    ${chatReplyModeField('mix')}
     <div class="chat-field"><span>每轮最多几条回复（1–3）</span><input type="text" id="groupReplyMax" value="2" inputmode="numeric"></div>
-    <div class="chat-note">每发一条消息会调用一次 AI（按模型价格计费）。语音条点按才合成，不会自动生成。</div>
+    <div class="chat-note">每发一条消息会调用一次 AI（按模型价格计费）。文字回复会立刻发出来；语音会在后台合成，先显示「合成中」再变成可播放的语音，合成失败会自动改发文字。</div>
   `, '建群', async () => {
     const picked = [...document.querySelectorAll('#groupMembers input:checked')].map((i) => i.value);
     if (!picked.length) { toast('至少选一个角色'); return; }
     const name = ($('groupName')?.value || '').trim().slice(0, 20) || picked.slice(0, 3).join('、');
     const scene = ($('groupScene')?.value || '').trim().slice(0, 400);
     const replyMax = Math.min(3, Math.max(1, parseInt($('groupReplyMax')?.value, 10) || 2));
+    const replyMode = chatPickedReplyMode();
     const c = {
-      id: uid(), bookId: book.id, name, scene, members: picked, replyMax,
+      id: uid(), bookId: book.id, name, scene, members: picked, replyMax, replyMode,
       messages: [], createdAt: Date.now(), updatedAt: Date.now(),
     };
     await idb.put('chats', c);
@@ -4195,6 +4546,7 @@ function openChatSettings() {
     <div class="chat-field"><span>群名</span><input type="text" id="groupName" value="${escapeAttr(chat.name)}"></div>
     <div class="chat-field"><span>场景 / 设定</span><textarea id="groupScene" rows="3">${escapeAttr(chat.scene || '')}</textarea></div>
     <div class="chat-field"><span>成员</span><div class="chat-members" id="groupMembers">${checks}</div></div>
+    ${chatReplyModeField(chat.replyMode || 'mix')}
     <div class="chat-field"><span>每轮最多几条回复（1–3）</span><input type="text" id="groupReplyMax" value="${chat.replyMax || 2}" inputmode="numeric"></div>
     <div class="row" style="margin-top:4px">
       <button id="btnClearChat" class="btn">清空聊天记录</button>
@@ -4207,6 +4559,7 @@ function openChatSettings() {
     chat.scene = ($('groupScene')?.value || '').trim().slice(0, 400);
     chat.members = picked;
     chat.replyMax = Math.min(3, Math.max(1, parseInt($('groupReplyMax')?.value, 10) || 2));
+    chat.replyMode = chatPickedReplyMode();
     chat.updatedAt = Date.now();
     await idb.put('chats', chat);
     closeChatModal();
@@ -4370,23 +4723,54 @@ function bindChat() {
   $('btnChatSettings').addEventListener('click', openChatSettings);
   $('btnChatSend').addEventListener('click', chatSendText);
   $('btnChatMic').addEventListener('click', () => setChatVoiceMode(!chatVoiceMode));
+  $('cqClear').addEventListener('click', () => { chatQuote = null; chatRenderQuoteBar(); });
+  $('msgMenu').addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-act]');
+    const m = msgMenuMsg;
+    if (!btn || !m) return;
+    const act = btn.dataset.act;
+    chatHideMsgMenu();
+    if (act === 'copy') chatCopyText(m.text);
+    else if (act === 'quote') chatSetQuote(m);
+    else if (act === 'del') chatDeleteMsg(m);
+    else if (act === 'tts') chatPlayTextTTS(m);
+  });
 
   const hold = $('btnChatHold');
   hold.addEventListener('pointerdown', (e) => {
     e.preventDefault();
     if (!chat || chatHoldActive) return;
     chatHoldActive = true;
+    chatHoldCancel = false;
+    chatHoldStartY = e.clientY;
     try { hold.setPointerCapture(e.pointerId); } catch {}
     chatStartRecording();
   });
-  const endHold = (e) => {
+  hold.addEventListener('pointermove', (e) => {
+    if (!chatHoldActive) return;
+    const cancel = chatHoldStartY - e.clientY > 60;
+    if (cancel !== chatHoldCancel) {
+      chatHoldCancel = cancel;
+      chatSetRecHint(cancel);
+    }
+  });
+  hold.addEventListener('pointerup', (e) => {
     if (!chatHoldActive) return;
     e.preventDefault();
     chatHoldActive = false;
-    chatStopRecording();
-  };
-  hold.addEventListener('pointerup', endHold);
-  hold.addEventListener('pointercancel', endHold);
+    if (chatHoldCancel) {
+      chatHoldCancel = false;
+      chatCancelRecording();
+    } else {
+      chatStopRecording();
+    }
+  });
+  hold.addEventListener('pointercancel', () => {
+    if (!chatHoldActive) return;
+    chatHoldActive = false;
+    chatHoldCancel = false;
+    chatCancelRecording();
+  });
   hold.addEventListener('contextmenu', (e) => e.preventDefault());
 
   const input = $('chatInput');
