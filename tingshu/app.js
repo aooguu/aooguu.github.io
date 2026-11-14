@@ -3,7 +3,7 @@
 const DEFAULT_BASE = 'https://api.xiaomimimo.com/v1';
 const AI_DEFAULT_BASE = 'https://api.deepseek.com/v1';
 const AI_DEFAULT_MODEL = 'deepseek-chat';
-const APP_VER = 'v12';
+const APP_VER = 'v13';
 const VOICES = [
   { id: '冰糖', label: '冰糖 · 中文女声' },
   { id: '茉莉', label: '茉莉 · 中文女声' },
@@ -52,7 +52,7 @@ function saveAi(patch) {
 let db = null;
 function openDB() {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open('tingshu', 2);
+    const req = indexedDB.open('tingshu', 3);
     req.onupgradeneeded = () => {
       const d = req.result;
       if (!d.objectStoreNames.contains('books')) d.createObjectStore('books', { keyPath: 'id' });
@@ -63,6 +63,10 @@ function openDB() {
       if (!d.objectStoreNames.contains('voices')) {
         const v = d.createObjectStore('voices', { keyPath: 'key' });
         v.createIndex('bookId', 'bookId');
+      }
+      if (!d.objectStoreNames.contains('scripts')) {
+        const sc = d.createObjectStore('scripts', { keyPath: 'key' });
+        sc.createIndex('bookId', 'bookId');
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -106,6 +110,19 @@ function deleteVoicesOfBook(bookId) {
   return new Promise((resolve, reject) => {
     const tx = db.transaction('voices', 'readwrite');
     const idx = tx.objectStore('voices').index('bookId');
+    const req = idx.openCursor(IDBKeyRange.only(bookId));
+    req.onsuccess = () => {
+      const cur = req.result;
+      if (cur) { cur.delete(); cur.continue(); }
+    };
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+function deleteScriptsOfBook(bookId) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('scripts', 'readwrite');
+    const idx = tx.objectStore('scripts').index('bookId');
     const req = idx.openCursor(IDBKeyRange.only(bookId));
     req.onsuccess = () => {
       const cur = req.result;
@@ -643,6 +660,30 @@ function speechCard(entry, stage) {
   return (desc + '。' + style).slice(0, 160);
 }
 
+const STABLE_TAGS = new Set(['磁性', '醇厚', '清亮', '空灵', '稚嫩', '苍老', '甜美', '沙哑', '醇雅', '御姐音', '正太音', '大叔音', '夹子音', '台湾腔', '东北话', '四川话', '河南话', '粤语', '低沉']);
+const LINE_TAG_DROP = new Set(['无', '正常', '不变', '自然', '普通']);
+
+function cleanLineTags(v) {
+  if (Array.isArray(v)) v = v.join(' ');
+  const raw = String(v || '').replace(/[()（）[\]【】,，、;；:：]/g, ' ').trim();
+  if (!raw) return '';
+  const out = [];
+  for (const token of raw.split(/\s+/)) {
+    if (!token || LINE_TAG_DROP.has(token)) continue;
+    if (!KNOWN_TAGS.has(token) && !/^[\u4e00-\u9fa5]{2,6}$/.test(token)) continue;
+    if (!out.includes(token)) out.push(token);
+    if (out.length >= 4) break;
+  }
+  return out.join(' ');
+}
+
+function identityCard(entry, stage) {
+  const desc = String(stage?.desc || entry?.voiceDesc || '').trim();
+  const stable = stageTags(stage, entry).split(/\s+/).filter((t) => STABLE_TAGS.has(t) && !desc.includes(t));
+  const out = [desc, stable.join(' ')].filter(Boolean).join('，');
+  return out.slice(0, 160);
+}
+
 function analyzeBook(text) {
   const names = mineNames(text);
   const nameSet = new Set(names.map(n => n.name));
@@ -800,6 +841,7 @@ function splitLong(text, max) {
 let book = null;
 let chapterIdx = 0;
 let chapterSegments = [];
+let chapterScriptLines = new Map();
 let currentSeg = -1;
 let chapterToken = 0;
 let playing = false;
@@ -860,6 +902,23 @@ function buildSegments(text) {
     }
   }
   return segs;
+}
+
+async function loadChapterScript() {
+  chapterScriptLines = new Map();
+  for (const seg of chapterSegments) delete seg.lineTags;
+  if (!book) return;
+  const rec = await idb.get('scripts', `${book.id}:${chapterIdx}`);
+  if (!rec || !Array.isArray(rec.lines)) return;
+  for (const line of rec.lines) {
+    const i = Number(line.i);
+    const seg = chapterSegments[i];
+    if (!seg || seg.text !== line.text) continue;
+    const tags = cleanLineTags(line.tags);
+    if (!tags) continue;
+    seg.lineTags = tags;
+    chapterScriptLines.set(i, { i, text: seg.text, speaker: seg.speaker, tags });
+  }
 }
 
 function defaultCast(b) {
@@ -1090,6 +1149,7 @@ async function getSegmentAudio(seg) {
   let voice = '冰糖', tags = '', card = '';
   const own = castStageFor(seg.speaker, chapterIdx);
   let entry = own.entry, stage = own.stage;
+  const lineTags = cleanLineTags(seg.lineTags);
   if (seg.speaker === '旁白' && b.firstPerson && b.protagonist && b.protagonist !== '我') {
     const pr = castStageFor(b.protagonist, chapterIdx);
     if (pr.entry) {
@@ -1099,10 +1159,17 @@ async function getSegmentAudio(seg) {
   }
   if (!s.singleVoice) {
     voice = entry?.voice || (seg.speaker === '旁白' ? '冰糖' : '苏打');
-    tags = stageTags(stage, entry);
-    card = speechCard(entry, stage);
+    if (lineTags) {
+      tags = lineTags;
+      card = identityCard(entry, stage);
+    } else {
+      tags = stageTags(stage, entry);
+      card = speechCard(entry, stage);
+    }
+  } else if (lineTags) {
+    tags = lineTags;
   }
-  const stamp = `t:${voice}:${tags}`;
+  const stamp = `${lineTags ? 'l' : 't'}:${voice}:${tags}`;
   const key = await hashKey([b.id, card, seg.text, stamp, 'v' + TTS_CACHE_VER].join('\u0000'));
   const rec = await idb.get('audio', key);
   if (rec?.blob) return rec.blob;
@@ -1305,6 +1372,7 @@ async function renderShelf() {
       if (!confirm(`删除《${b.title}》和它的全部音频缓存？`)) return;
       await deleteAudioOfBook(b.id);
       await deleteVoicesOfBook(b.id);
+      await deleteScriptsOfBook(b.id);
       await idb.del('books', b.id);
       localStorage.removeItem('tts.progress.' + b.id);
       renderShelf();
@@ -1340,6 +1408,7 @@ async function openBook(id) {
   const p = loadProgress(b.id) || { chapter: 0, segment: 0 };
   chapterIdx = Math.min(p.chapter || 0, b.chapters.length - 1);
   chapterSegments = buildSegments(b.chapters[chapterIdx].content);
+  await loadChapterScript();
   currentSeg = -1;
   playing = false;
   audioEl.pause();
@@ -1376,13 +1445,14 @@ function renderChapters() {
   });
 }
 
-function openChapter(i, goPlayer) {
+async function openChapter(i, goPlayer) {
   chapterIdx = i;
   chapterToken++;
   clearUrlCache();
   stopPlayback();
   audioEl.removeAttribute('src');
   chapterSegments = buildSegments(book.chapters[i].content);
+  await loadChapterScript();
   currentSeg = -1;
   saveProgress();
   renderChapters();
@@ -1766,8 +1836,10 @@ function escapeAttr(s) {
 /* ---------------- 播放页 ---------------- */
 function renderPlayer() {
   if (!book) return;
-  $('nowChapter').innerHTML = `<span id="nowChapterTitle"></span><button class="mini-btn" id="btnExport">导出本章 MP3</button>`;
+  const scriptLabel = chapterScriptLines.size ? `AI 语气 ${chapterScriptLines.size}` : 'AI 语气';
+  $('nowChapter').innerHTML = `<span id="nowChapterTitle"></span><button class="mini-btn" id="btnScript" title="用 AI 给本章每句标语气，不改原文">${scriptLabel}</button><button class="mini-btn" id="btnExport">导出本章 MP3</button>`;
   $('nowChapterTitle').textContent = book.chapters[chapterIdx].title;
+  $('btnScript').addEventListener('click', aiAnnotateChapter);
   $('btnExport').addEventListener('click', exportChapter);
 
   const list = $('segList');
@@ -1782,9 +1854,11 @@ function renderPlayer() {
     el.className = 'seg-item';
     el.dataset.i = i;
     const cls = seg.speaker === '旁白' ? 'narrator' : (seg.speaker === '未知角色' ? 'unknown' : '');
-    el.innerHTML = `<div class="seg-meta"><span class="chip ${cls}"></span><span class="seg-idx">${i + 1}</span></div><div class="seg-text"></div>`;
+    const lineTags = cleanLineTags(seg.lineTags);
+    el.innerHTML = `<div class="seg-meta"><span class="chip ${cls}"></span><span class="seg-idx">${i + 1}</span></div><div class="seg-text"></div>${lineTags ? '<div class="seg-tags"></div>' : ''}`;
     el.querySelector('.chip').textContent = seg.speaker;
     el.querySelector('.seg-text').textContent = seg.text;
+    if (lineTags) el.querySelector('.seg-tags').textContent = lineTags;
     el.addEventListener('click', () => { showView('player'); playIndex(i); });
     frag.appendChild(el);
   });
@@ -1914,7 +1988,17 @@ const AI_SYS = `你是中文小说角色分析助手。阅读给出的原文片�
 {"characters":[{"name":"","aliases":[],"gender":"F","voice":"茉莉","stage":"青年","voiceDesc":"","tags":"","tagBasis":{},"tone":""}],"firstPerson":true,"protagonist":""}`;
 let aiAbort = null;
 let aiPreview = null;
+let aiScriptPreview = null;
 let aiCancelled = false;
+
+const AI_SCRIPT_SYS = `你是中文小说配音导演。下面给出按顺序切好的旁白和对白段落，请给需要表演提示的句子标上 1-3 个简短中文语气标签。
+要求：
+- 不改写、不删减、不补充任何台词，只输出段落索引和标签。
+- 结合上下文判断情绪、音量、语速、气息；叙述句也要判断，语气平稳的可以省略。
+- 标签要短，2-6 个汉字，例如：愤怒/悲伤/哽咽/冷笑/讥讽/恐惧/得意/焦急/无奈/温柔/平静/激动/压低声音/提高音量/轻声/耳语/喊叫/颤抖/叹气/停顿/语速较快/语速缓慢。
+- 不要输出“无/正常/自然/普通”这类空标签；不要贴音色，音色由角色卡决定。
+- 只标注“lines”里的段落；“before”只是上文参考，不要输出。
+只输出 JSON，格式：{"lines":[{"i":0,"tags":"愤怒 提高音量"}]}`;
 
 const AI_TAG_FILLERS = new Set(['温柔', '平稳']);
 
@@ -2298,6 +2382,7 @@ function closeAi() {
   $('aiBody').innerHTML = '';
   $('aiApply').hidden = true;
   aiPreview = null;
+  aiScriptPreview = null;
 }
 
 function aiTagLine(tags, notes) {
@@ -2520,8 +2605,147 @@ async function aiApplySelection() {
   toast(`已应用 ${picked.length} 个角色`);
 }
 
-function aiNudgeCheck() {
-  const el = $('aiNudge');
+function aiScriptChunks(segs) {
+  const chunks = [];
+  let start = 0;
+  let chars = 0;
+  for (let i = 0; i < segs.length; i++) {
+    const len = segs[i].text.length;
+    if (i > start && chars + len > 12000) {
+      chunks.push({ from: start, to: i - 1, chars });
+      start = i;
+      chars = 0;
+    }
+    chars += len;
+  }
+  if (start < segs.length) chunks.push({ from: start, to: segs.length - 1, chars });
+  return chunks;
+}
+
+function aiParseScriptResult(j, from, to) {
+  const arr = Array.isArray(j) ? j : (Array.isArray(j?.lines) ? j.lines : []);
+  const out = new Map();
+  for (const it of arr) {
+    if (!it || typeof it !== 'object') continue;
+    const i = Number(it.i ?? it.index ?? it.idx);
+    if (!Number.isInteger(i) || i < from || i > to) continue;
+    const tags = cleanLineTags(it.tags ?? it.tag ?? it.tone);
+    if (tags) out.set(i, tags);
+  }
+  return out;
+}
+
+async function aiAnnotateChapter() {
+  if (!book || !chapterSegments.length) return;
+  const cfg = loadAi();
+  if (!cfg.baseUrl || !cfg.key || !cfg.model) {
+    toast('先在设置里填写 AI API Key');
+    showView('settings');
+    return;
+  }
+  const chIdx = chapterIdx;
+  const segs = chapterSegments.slice();
+  const title = book.chapters[chIdx].title;
+  const totalChars = segs.reduce((n, s) => n + s.text.length, 0);
+  const estIn = Math.round(totalChars / 1.6);
+  const estOut = Math.round(segs.length * 18);
+  const replace = chapterScriptLines.size ? `本章已有 ${chapterScriptLines.size} 句标注，应用后将替换。` : '';
+  if (!confirm(`AI 标注第 ${chIdx + 1} 章语气：${segs.length} 段、约 ${totalChars} 字。\n预计输入约 ${(estIn / 10000).toFixed(1)} 万 tokens、输出约 ${(estOut / 10000).toFixed(2)} 万 tokens，会按模型价格计费。${replace}\n\n原文不会改动，只给每句加语气标签。确认继续？`)) return;
+
+  const chunks = aiScriptChunks(segs);
+  const marks = new Map();
+  const errors = [];
+  aiCancelled = false;
+  aiAbort = new AbortController();
+  openAi(`AI 语气标注中 · 第 ${chIdx + 1} 章`, `<div class="ai-sum" id="aiProgText">准备中…</div><div class="ai-progress"><i id="aiProgBar"></i></div><div class="ai-sum">可点“停止”中断；已发出的请求仍会计费。</div>`);
+  for (let ci = 0; ci < chunks.length; ci++) {
+    if (aiAbort && aiAbort.signal.aborted) break;
+    const c = chunks[ci];
+    const txt = $('aiProgText');
+    if (txt) txt.textContent = `第 ${ci + 1}/${chunks.length} 段 · 第 ${c.from + 1}–${c.to + 1} 句`;
+    const bar = $('aiProgBar');
+    if (bar) bar.style.width = `${Math.round((ci / chunks.length) * 100)}%`;
+    const lines = [];
+    for (let i = c.from; i <= c.to; i++) lines.push({ i, speaker: segs[i].speaker, text: segs[i].text });
+    const before = segs.slice(Math.max(0, c.from - 3), c.from).map((s) => ({ speaker: s.speaker, text: s.text }));
+    try {
+      const raw = await aiChat([
+        { role: 'system', content: AI_SCRIPT_SYS },
+        { role: 'user', content: `本章：${title}\n${JSON.stringify({ before, lines })}` },
+      ], { json: true, signal: aiAbort ? aiAbort.signal : undefined });
+      const j = parseAiJson(raw);
+      if (!j) { errors.push(`第 ${ci + 1} 段：返回不是 JSON`); continue; }
+      for (const [i, tags] of aiParseScriptResult(j, c.from, c.to)) marks.set(i, tags);
+    } catch (e) {
+      if (e.name === 'AbortError') break;
+      errors.push(`第 ${ci + 1} 段：${e.message || e}`);
+    }
+  }
+  aiAbort = null;
+  if (aiCancelled) return;
+  if (!marks.size) {
+    const errLine = errors.length ? `<div class="ai-err">${errors.slice(0, 5).map((e) => escapeAttr(e)).join('<br>')}</div>` : '';
+    openAi('AI 语气标注', `<div class="ai-sum">本章没有识别到明显的语气变化。</div>${errLine}`);
+    return;
+  }
+  const lines = [...marks.entries()]
+    .map(([i, tags]) => ({ i, speaker: segs[i].speaker, text: segs[i].text, tags }))
+    .sort((a, b) => a.i - b.i);
+  aiScriptPreview = {
+    lines,
+    meta: { bookId: book.id, chapterIdx: chIdx, title, totalChars, estOut },
+  };
+  const rows = lines.map((l) => `<div class="ai-row">
+    <input type="checkbox" data-i="${l.i}" checked>
+    <div class="ai-main">
+      <div class="ai-name"><span class="ai-badge">${escapeAttr(l.speaker)}</span><span class="ai-badge">第 ${l.i + 1} 句</span></div>
+      <div class="ai-line-text">${escapeAttr(l.text)}</div>
+      <input class="cast-tags script-tags" data-i="${l.i}" value="${escapeAttr(l.tags)}" placeholder="本句语气，如：愤怒 语速较快">
+    </div>
+  </div>`).join('');
+  const metaLine = `第 ${chIdx + 1} 章 · ${lines.length} 句标注 · ${totalChars} 字 · 约 ${(estOut / 1000).toFixed(1)}k 输出 tokens`;
+  const errLine = errors.length ? `<div class="ai-err">${errors.slice(0, 4).map((e) => escapeAttr(e)).join('<br>')}</div>` : '';
+  openAi('AI 语气标注结果', `<div class="ai-sum">${metaLine}</div>${rows}${errLine}`, '应用标注');
+}
+
+async function aiApplyScript() {
+  if (!aiScriptPreview) return;
+  const { lines, meta } = aiScriptPreview;
+  const picked = [];
+  for (const l of lines) {
+    const cb = document.querySelector(`#aiBody input[type=checkbox][data-i="${l.i}"]`);
+    if (cb && !cb.checked) continue;
+    const inp = document.querySelector(`#aiBody .script-tags[data-i="${l.i}"]`);
+    const tags = cleanLineTags(inp ? inp.value : l.tags);
+    if (!tags) continue;
+    picked.push({ i: l.i, text: l.text, tags });
+  }
+  await idb.put('scripts', {
+    key: `${meta.bookId}:${meta.chapterIdx}`,
+    bookId: meta.bookId,
+    chapterIdx: meta.chapterIdx,
+    chapterTitle: meta.title,
+    lines: picked,
+    updatedAt: Date.now(),
+  });
+  if (book && book.id === meta.bookId && chapterIdx === meta.chapterIdx) {
+    chapterScriptLines = new Map();
+    for (const seg of chapterSegments) delete seg.lineTags;
+    for (const l of picked) {
+      const seg = chapterSegments[l.i];
+      if (!seg || seg.text !== l.text) continue;
+      seg.lineTags = l.tags;
+      chapterScriptLines.set(l.i, { i: l.i, text: l.text, speaker: seg.speaker, tags: l.tags });
+    }
+    clearUrlCache();
+    renderPlayer();
+    updatePlayerBar();
+  }
+  closeAi();
+  toast(`已应用 ${picked.length} 句语气`);
+}
+
+function aiNudgeCheck() {  const el = $('aiNudge');
   if (!el) return;
   const at = book?.ai?.analyzedTo ?? -1;
   if (!book || at < 0 || at >= book.chapters.length - 1 || book.ai.nudgeDismissedTo === at) { el.hidden = true; return; }
@@ -2734,7 +2958,7 @@ function bind() {
 
   $('aiClose').addEventListener('click', closeAi);
   $('aiCancel').addEventListener('click', closeAi);
-  $('aiApply').addEventListener('click', aiApplySelection);
+  $('aiApply').addEventListener('click', () => { if (aiScriptPreview) aiApplyScript(); else aiApplySelection(); });
 
   $('btnAiNudge').addEventListener('click', aiAnalyzeBook);
   $('btnAiNudgeLater').addEventListener('click', () => {
