@@ -3,6 +3,7 @@
 const DEFAULT_BASE = 'https://api.xiaomimimo.com/v1';
 const AI_DEFAULT_BASE = 'https://api.deepseek.com/v1';
 const AI_DEFAULT_MODEL = 'deepseek-chat';
+const APP_VER = 'v6';
 const VOICES = [
   { id: '冰糖', label: '冰糖 · 中文女声' },
   { id: '茉莉', label: '茉莉 · 中文女声' },
@@ -1583,6 +1584,7 @@ function renderSettings() {
   $('aiBaseUrl').value = ai.baseUrl || '';
   $('aiKey').value = ai.key || '';
   $('aiModel').value = ai.model || '';
+  if ($('appVer')) $('appVer').textContent = `页面版本 ${APP_VER}`;
   updateCacheInfo();
 }
 
@@ -2163,6 +2165,13 @@ function bind() {
   $('topTitle').textContent = 'TXT 听书';
 
   if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
+    const hadController = !!navigator.serviceWorker.controller;
+    let reloading = false;
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if (!hadController || reloading) return;
+      reloading = true;
+      location.reload();
+    });
     navigator.serviceWorker.register('sw.js').catch(() => {});
   }
 })();

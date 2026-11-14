@@ -1,4 +1,4 @@
-const CACHE = 'tingshu-v5';
+const CACHE = 'tingshu-v6';
 const ASSETS = [
   './',
   './index.html',
@@ -10,7 +10,16 @@ const ASSETS = [
 ];
 
 self.addEventListener('install', (e) => {
-  e.waitUntil(caches.open(CACHE).then((c) => c.addAll(ASSETS)).then(() => self.skipWaiting()));
+  e.waitUntil((async () => {
+    const c = await caches.open(CACHE);
+    await Promise.all(ASSETS.map(async (u) => {
+      try {
+        const res = await fetch(u, { cache: 'reload' });
+        if (res.ok) await c.put(u, res);
+      } catch {}
+    }));
+    await self.skipWaiting();
+  })());
 });
 
 self.addEventListener('activate', (e) => {
