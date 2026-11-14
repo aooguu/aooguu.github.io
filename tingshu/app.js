@@ -3,7 +3,7 @@
 const DEFAULT_BASE = 'https://api.xiaomimimo.com/v1';
 const AI_DEFAULT_BASE = 'https://api.deepseek.com/v1';
 const AI_DEFAULT_MODEL = 'deepseek-chat';
-const APP_VER = 'v8';
+const APP_VER = 'v9';
 const VOICES = [
   { id: '冰糖', label: '冰糖 · 中文女声' },
   { id: '茉莉', label: '茉莉 · 中文女声' },
@@ -550,6 +550,99 @@ function defaultTone(gender) {
   return gender === 'F' ? '声音柔和' : gender === 'M' ? '声音沉稳' : '平稳自然';
 }
 
+const TAG_RULES = [
+  [/(磁性)/, '磁性'],
+  [/(醇厚|浑厚)/, '醇厚'],
+  [/(清亮|清脆|清朗|明亮)/, '清亮'],
+  [/(空灵)/, '空灵'],
+  [/(稚嫩|童声|奶声|孩子气)/, '稚嫩'],
+  [/(苍老|沧桑|年迈|老人|老年|暮年)/, '苍老'],
+  [/(甜美|甜腻|软糯)/, '甜美'],
+  [/(沙哑|嘶哑|烟嗓)/, '沙哑'],
+  [/(醇雅|优雅)/, '醇雅'],
+  [/(御姐)/, '御姐音'],
+  [/(正太)/, '正太音'],
+  [/(大叔)/, '大叔音'],
+  [/(夹子音)/, '夹子音'],
+  [/(台湾腔|台湾国语)/, '台湾腔'],
+  [/(东北话|东北腔)/, '东北话'],
+  [/(四川话|川渝)/, '四川话'],
+  [/(河南话)/, '河南话'],
+  [/(粤语|广东话)/, '粤语'],
+  [/(温柔|温和|柔和)/, '温柔'],
+  [/(高冷|冰冷|冷硬|冷淡)/, '高冷'],
+  [/(活泼|开朗|欢快)/, '活泼'],
+  [/(严肃|严厉|威严)/, '严肃'],
+  [/(慵懒|懒散)/, '慵懒'],
+  [/(俏皮|调皮)/, '俏皮'],
+  [/(深沉|低沉|沉厚|沉稳)/, '低沉'],
+  [/(干练|利落)/, '干练'],
+  [/(凌厉|锋利|咄咄逼人)/, '凌厉'],
+  [/(语速(?:较|偏)?快|语速加快|急促|连珠炮)/, '语速较快'],
+  [/(语速(?:较|偏)?慢|语速缓慢|缓慢|慢条斯理)/, '语速缓慢'],
+  [/(语速适中|语速平稳)/, '语速适中'],
+  [/(愤怒|暴怒|发怒)/, '愤怒'],
+  [/(悲伤|悲痛|哀伤)/, '悲伤'],
+  [/(冷漠|淡漠)/, '冷漠'],
+  [/(惊恐|恐惧|害怕)/, '恐惧'],
+  [/(得意|嚣张)/, '得意'],
+  [/(平稳自然|平稳)/, '平稳'],
+];
+
+const KNOWN_TAGS = new Set(TAG_RULES.map(r => r[1]));
+
+function cleanTagList(v) {
+  if (Array.isArray(v)) v = v.join(' ');
+  const raw = String(v || '').replace(/[()（）\[\]【】,，、;；]/g, ' ').trim();
+  if (!raw) return '';
+  const tokens = raw.split(/\s+/);
+  const out = [];
+  for (const token of tokens) {
+    if (!token) continue;
+    if (KNOWN_TAGS.has(token)) {
+      if (!out.includes(token)) out.push(token);
+    } else {
+      const derived = deriveTags(token);
+      if (derived.length) {
+        for (const t of derived) if (!out.includes(t)) out.push(t);
+      } else if (token.length <= 6) {
+        if (!out.includes(token)) out.push(token);
+      }
+    }
+    if (out.length >= 6) break;
+  }
+  return out.slice(0, 6).join(' ');
+}
+
+function deriveTags(...parts) {
+  const text = parts.filter(Boolean).join(' ');
+  const out = [];
+  for (const [re, tag] of TAG_RULES) {
+    if (re.test(text) && !out.includes(tag)) out.push(tag);
+    if (out.length >= 6) break;
+  }
+  return out;
+}
+
+function entryTags(entry) {
+  if (!entry) return '';
+  return cleanTagList(entry.tags) || deriveTags(entry.voiceDesc, entry.style).join(' ');
+}
+
+function stageTags(stage, entry) {
+  if (!stage) return entryTags(entry);
+  return cleanTagList(stage.tags) || deriveTags(stage.desc, stage.style || entry?.style, stage.label).join(' ');
+}
+
+function speechCard(entry, stage) {
+  if (!entry && !stage) return '';
+  const desc = String(stage?.desc || entry?.voiceDesc || '').trim();
+  const style = String(stage?.style || entry?.style || '').trim();
+  if (!desc) return style.slice(0, 160);
+  if (!style || desc.includes(style)) return desc.slice(0, 160);
+  return (desc + '。' + style).slice(0, 160);
+}
+
 function analyzeBook(text) {
   const names = mineNames(text);
   const nameSet = new Set(names.map(n => n.name));
@@ -842,23 +935,25 @@ function saveBookSoon() {
 }
 
 /* ---------------- 合成 ---------------- */
-const TTS_CACHE_VER = 4;
+const TTS_CACHE_VER = 5;
 const VOICE_DESIGN_TEXT = '你来了。夜里的风有些凉，先进屋坐坐吧，我给你倒杯热茶。';
 
-async function requestTTS(text, voice, style, signal, sample) {
+async function requestTTS(text, voice, tags, card, signal) {
   const s = loadSettings();
   const apiKey = (s.apiKey || '').trim();
   if (!apiKey) throw new Error('请先在设置里填写 API Key');
   const base = (s.baseUrl || DEFAULT_BASE).replace(/\/+$/, '');
-  const cleanStyle = String(style || '').replace(/[()（）\[\]\r\n]/g, ' ').replace(/\s+/g, ' ').trim();
+  const tagStr = cleanTagList(tags);
+  const cardText = String(card || '').trim().slice(0, 200);
   const messages = [];
-  if (cleanStyle) messages.push({ role: 'user', content: cleanStyle });
-  const tagged = cleanStyle && cleanStyle.length <= 16 ? `（${cleanStyle}）${text}` : text;
-  messages.push({ role: 'assistant', content: tagged });
+  if (cardText) messages.push({ role: 'user', content: cardText });
+  messages.push({ role: 'assistant', content: (tagStr ? `（${tagStr.replace(/\s+/g, '，')}）` : '') + text });
 
-  const body = JSON.stringify(sample
-    ? { model: 'mimo-v2.5-tts-voiceclone', messages, audio: { format: 'mp3', voice: sample } }
-    : { model: 'mimo-v2.5-tts', messages, audio: { format: 'mp3', voice } });
+  const body = JSON.stringify({
+    model: 'mimo-v2.5-tts',
+    messages,
+    audio: { format: 'mp3', voice: voice || '冰糖' },
+  });
   let lastErr = null;
   for (let attempt = 0; attempt < 2; attempt++) {
     let res;
@@ -987,38 +1082,26 @@ async function ensureDesignSample(bookId, owner, label, holder, desc) {
 async function getSegmentAudio(seg) {
   const b = book;
   const s = loadSettings();
-  let voice = '冰糖', style = '', sample = '', desc = '';
-  let sampleOwner = seg.speaker;
+  let voice = '冰糖', tags = '', card = '';
   const own = castStageFor(seg.speaker, chapterIdx);
   let entry = own.entry, stage = own.stage;
-  let realEntry = (b.cast || {})[seg.speaker] || null;
   if (seg.speaker === '旁白' && b.firstPerson && b.protagonist && b.protagonist !== '我') {
-    sampleOwner = b.protagonist;
     const pr = castStageFor(b.protagonist, chapterIdx);
     if (pr.entry) {
       entry = Object.assign({}, entry, pr.entry);
       stage = pr.stage;
-      realEntry = (b.cast || {})[b.protagonist] || null;
     }
   }
   if (!s.singleVoice) {
     voice = entry?.voice || (seg.speaker === '旁白' ? '冰糖' : '苏打');
-    style = entry?.style || '';
-    if (entry?.voiceMode === 'design') {
-      desc = String((stage && stage.desc) || entry.voiceDesc || '').trim();
-      const ref = stage ? (stage.sampleRef || '') : (entry.sampleRef || '');
-      if (ref) sample = await getVoiceSample(b.id, sampleOwner, ref);
-      if (!sample && desc) sample = await getVoiceSample(b.id, sampleOwner, await descRef(desc));
-      if (!sample && desc) sample = await ensureDesignSample(b.id, sampleOwner, seg.speaker, stage || realEntry, desc);
-    }
+    tags = stageTags(stage, entry);
+    card = speechCard(entry, stage);
   }
-  const tagRef = stage ? (stage.sampleRef || '') : (realEntry?.sampleRef || entry?.sampleRef || '');
-  const tagId = (stage && stage.sampleId) || realEntry?.sampleId || entry?.sampleId || '';
-  const stamp = sample ? `c:${tagRef || (desc ? await descRef(desc) : 'x')}:${tagId}` : `p:${voice}`;
-  const key = await hashKey([b.id, style, seg.text, stamp, 'v' + TTS_CACHE_VER].join('\u0000'));
+  const stamp = `t:${voice}:${tags}`;
+  const key = await hashKey([b.id, card, seg.text, stamp, 'v' + TTS_CACHE_VER].join('\u0000'));
   const rec = await idb.get('audio', key);
   if (rec?.blob) return rec.blob;
-  const blob = await requestTTS(seg.text, voice, style, undefined, sample);
+  const blob = await requestTTS(seg.text, voice, tags, card);
   await idb.put('audio', { key, bookId: b.id, blob, size: blob.size, createdAt: Date.now() });
   return blob;
 }
@@ -1321,17 +1404,8 @@ function castList() {
   return [...map.entries()].sort((a, b) => b[1].count - a[1].count);
 }
 
-function voiceOptions(selected, allowDesign) {
-  const opts = VOICES.map(v => `<option value="${v.id}"${v.id === selected ? ' selected' : ''}>${v.label}</option>`).join('');
-  return opts + (allowDesign ? `<option value="__design"${selected === '__design' ? ' selected' : ''}>声音设计（自定义音色）</option>` : '');
-}
-function defaultVoiceDesc(gender, tone) {
-  const base = gender === 'F' ? '女性' : gender === 'M' ? '男性' : '中性';
-  const t = String(tone || '').trim();
-  return `${base}嗓音，${t || '自然平和'}。`;
-}
-function stageHasSample(st) {
-  return !!(st && st.sampleRef && st.sampleDesc === st.desc);
+function voiceOptions(selected) {
+  return VOICES.map(v => `<option value="${v.id}"${v.id === selected ? ' selected' : ''}>${v.label}</option>`).join('');
 }
 function normalizeEntryStages(e) {
   if (!e || !Array.isArray(e.stages) || e.stages.length < 2) return false;
@@ -1346,6 +1420,7 @@ function normalizeEntryStages(e) {
       if (!prev.desc && st.desc) prev.desc = st.desc;
       if (!prev.style && st.style) prev.style = st.style;
       if (!prev.voice && st.voice) prev.voice = st.voice;
+      if (!prev.tags && st.tags) prev.tags = st.tags;
       if (!prev.sampleRef && st.sampleRef && (!st.sampleDesc || st.sampleDesc === st.desc)) {
         prev.sampleRef = st.sampleRef;
         prev.sampleDesc = st.sampleDesc;
@@ -1368,61 +1443,37 @@ function normalizeEntryStages(e) {
     if (st.desc) e.voiceDesc = st.desc;
     if (st.style) e.style = st.style;
     if (st.voice) e.voice = st.voice;
+    if (st.tags) e.tags = st.tags;
+    else e.tags = deriveTags(st.desc, st.style, st.label).join(' ');
     if (st.sampleRef) {
       e.sampleRef = st.sampleRef;
       e.sampleDesc = st.sampleDesc;
       e.sampleId = e.sampleId || st.sampleId || Date.now();
     }
-    if (!e.voiceMode) e.voiceMode = 'design';
   }
   return true;
 }
-function collectVoiceTasks() {
-  const tasks = [];
+function retagAll() {
+  let n = 0;
   for (const [name, e] of Object.entries(book?.cast || {})) {
-    if (name === '旁白' || !e) continue;
+    if (!e) continue;
     if (e.stages && e.stages.length > 1) {
       for (const st of e.stages) {
-        if (st.desc && !stageHasSample(st)) tasks.push({ name, desc: st.desc, stage: st });
+        const t = deriveTags(st.desc, st.style || e.style, st.label).join(' ');
+        if (t) { st.tags = t; n++; }
       }
-    } else if (e.voiceMode === 'design' && e.voiceDesc && !e.sampleId) {
-      tasks.push({ name, desc: e.voiceDesc, stage: null });
+    } else {
+      const t = deriveTags(e.voiceDesc || (name === '旁白' ? e.style : ''), e.style).join(' ');
+      if (t) { e.tags = t; n++; }
     }
   }
-  return tasks;
-}
-async function generateVoiceTasks(tasks) {
-  let ok = 0, fail = 0;
-  for (let i = 0; i < tasks.length; i++) {
-    const t = tasks[i];
-    const e = (book.cast || {})[t.name];
-    if (!e) continue;
-    const tag = t.stage ? ` · ${t.stage.label || aiRangeLabel(t.stage)}` : '';
-    toast(`生成音色 ${i + 1}/${tasks.length}：${t.name}${tag}`, 120000);
-    try {
-      const uri = await designVoice(t.desc);
-      const ref = await descRef(t.desc);
-      await putVoiceSample(book.id, t.name, uri, t.desc, ref);
-      e.voiceMode = 'design';
-      if (t.stage) {
-        t.stage.sampleRef = ref;
-        t.stage.sampleDesc = t.desc;
-        t.stage.sampleId = Date.now();
-      } else {
-        e.voiceDesc = t.desc;
-        e.sampleRef = ref;
-        e.sampleDesc = t.desc;
-        e.sampleId = Date.now();
-      }
-      ok++;
-    } catch { fail++; }
-  }
   saveBookSoon();
+  clearUrlCache();
   renderCast();
-  toast(`音色生成完成：${ok} 个${fail ? `，${fail} 个失败` : ''}`, 6000);
+  toast(`已重贴 ${n} 个风格标签`);
 }
 function syncVoiceToGender(entry) {
-  if (!entry || entry.voiceMode === 'design') return false;
+  if (!entry) return false;
   const g = entry.gender;
   if (g !== 'F' && g !== 'M') return false;
   const wrong = g === 'F' ? ['苏打', '白桦'] : ['茉莉', '冰糖'];
@@ -1504,7 +1555,7 @@ function renderCast() {
       <span class="cast-actions">
         <button class="mini-btn" id="btnReanalyze" title="重新分析全书人名、性别和语气">重新分析</button>
         <button class="mini-btn" id="btnAiCast" title="${win.start <= win.end ? `AI 解析第 ${win.start + 1}–${win.end + 1} 章` : '全书已解析'}">${aiBtn}</button>
-        <button class="mini-btn" id="btnMakeVoices" title="为选了“声音设计”且填了描述的角色生成音色">批量音色</button>
+        <button class="mini-btn" id="btnMakeVoices" title="按音色描述和语气重新生成所有角色的风格标签">重贴标签</button>
         <button class="mini-btn" id="btnAddCast">＋ 角色</button>
       </span>
     </div>
@@ -1514,32 +1565,28 @@ function renderCast() {
         <span class="cast-count">${fp ? `叙述 · 用${book.protagonist}的声音` : '叙述'}</span>
       </div>
       <div class="cast-grid">
-        <select class="cast-voice">${voiceOptions(narrator.voice, false)}</select>
+        <select class="cast-voice">${voiceOptions(narrator.voice)}</select>
         <input class="cast-style" placeholder="语气指令（可留空）" value="${escapeAttr(narrator.style || '')}">
         <button class="mini-btn cast-preview">试听</button>
       </div>
+      <input class="cast-tags cast-tags-main" placeholder="风格标签，如：平稳 语速适中" value="${escapeAttr(entryTags(narrator))}">
     </div>
     ${rows.map(([name, info]) => {
       const e = castEntryFor(name);
       const g = e.gender || '?';
-      const isDesign = e.voiceMode === 'design';
       const staged = !!(e.stages && e.stages.length > 1);
       const stageHtml = staged ? `<div class="cast-stages">
         <div class="stage-caption">声音分期 · 播放时按章自动切换</div>
-        ${e.stages.map((st, si) => {
-          const ok = stageHasSample(st);
-          return `<div class="stage-row" data-si="${si}">
+        ${e.stages.map((st, si) => `<div class="stage-row" data-si="${si}">
             <div class="stage-meta">
               <span class="stage-range">${aiRangeLabel(st)}</span>
               ${st.label ? `<span class="ai-badge">${escapeAttr(st.label)}</span>` : ''}
             </div>
-            <input class="cast-vdesc stage-desc" placeholder="该阶段的音色描述" value="${escapeAttr(st.desc || '')}">
+            <input class="cast-tags stage-tags" placeholder="风格标签，如：苍老 沙哑 语速缓慢" title="${escapeAttr(st.desc || '')}" value="${escapeAttr(stageTags(st, e))}">
             <div class="row">
-              <button class="mini-btn stage-gen">${ok ? '重新生成音色' : '生成音色'}</button>
-              <button class="mini-btn stage-preview"${ok ? '' : ' hidden'}>试听</button>
+              <button class="mini-btn stage-preview">试听该阶段</button>
             </div>
-          </div>`;
-        }).join('')}
+          </div>`).join('')}
       </div>` : '';
       return `<div class="cast-row" data-name="${escapeAttr(name)}">
         <div class="cast-top">
@@ -1548,37 +1595,21 @@ function renderCast() {
           <span class="cast-count">${info.count || 0} 句${staged ? ` · ${e.stages.length} 个阶段` : ''}</span>
         </div>
         <div class="cast-grid">
-          <select class="cast-voice">${voiceOptions(isDesign ? '__design' : e.voice, true)}</select>
+          <select class="cast-voice">${voiceOptions(e.voice)}</select>
           <input class="cast-style" placeholder="语气指令（可留空）" value="${escapeAttr(e.style || '')}">
           <button class="mini-btn cast-preview">试听</button>
         </div>
+        ${staged ? '' : `<input class="cast-tags cast-tags-main" placeholder="风格标签，如：磁性 低沉 语速缓慢" title="${escapeAttr(e.voiceDesc || '')}" value="${escapeAttr(entryTags(e))}">`}
         ${stageHtml}
-        ${isDesign && !staged ? `<div class="cast-design">
-          <input class="cast-vdesc" placeholder="音色描述：年龄、性别、音质、语速" value="${escapeAttr(e.voiceDesc || '')}">
-          <div class="row">
-            <button class="mini-btn cast-gen">${e.sampleId ? '重新生成音色' : '生成音色'}</button>
-            <button class="mini-btn cast-sample"${e.sampleId ? '' : ' hidden'}>试听音色</button>
-          </div>
-        </div>` : ''}
       </div>`;
     }).join('')}
-        <p class="cast-note">${fp ? `第一人称：旁白和对白里的“我”都按主角「${escapeAttr(book.protagonist)}」处理。` : ''}性别和语气由全书统计推断，可点 ? 修改；改名字会把同名的话合并。AI 解析按批推进（每批约 ${(AI_WINDOW_CHARS / 10000).toFixed(0)} 万字），会按章记录角色的年龄阶段；同一时期只保留一个音色，不会因为描述措辞不同反复换声。听到离本批结尾约 ${(AI_NUDGE_CHARS / 10000).toFixed(0)} 万字时会提醒继续解析。还没生成音色的阶段，播放时会自动生成一次并复用，之后不会每句重做。<br>语气写法：「苍老」「沙哑」「语速缓慢」这类短词会作为风格标签生效，比“老人音”更可靠；长句作为自然语言指令。</p>`;
+        <p class="cast-note">${fp ? `第一人称：旁白和对白里的“我”都按主角「${escapeAttr(book.protagonist)}」处理。` : ''}性别和语气由全书统计推断，可点 ? 修改；改名字会把同名的话合并。AI 解析按批推进（每批约 ${(AI_WINDOW_CHARS / 10000).toFixed(0)} 万字），会按章记录角色的年龄阶段；同一时期只保留一套标签，不会因为描述措辞不同反复换声。听到离本批结尾约 ${(AI_NUDGE_CHARS / 10000).toFixed(0)} 万字时会提醒继续解析。<br>播放时用基础模型实时合成，标签直接控制音色和语气，不再生成或复刻样本：标签留空会按音色描述自动推导；短词如「沙哑」「苍老」「语速缓慢」比长句更稳定，最多 6 个，用空格分隔。</p>`;
 
   panel.querySelectorAll('.cast-row').forEach(row => {
     const name = row.dataset.name;
     row.querySelector('.cast-voice').addEventListener('change', (e) => {
       book.cast[name] = book.cast[name] || { voice: '苏打', style: '' };
       const v = e.target.value;
-      if (v === '__design') {
-        book.cast[name].voiceMode = 'design';
-        if (!book.cast[name].voiceDesc) {
-          book.cast[name].voiceDesc = defaultVoiceDesc(book.cast[name].gender, book.cast[name].style);
-        }
-        saveBookSoon();
-        renderCast();
-        return;
-      }
-      book.cast[name].voiceMode = 'preset';
       book.cast[name].voice = v;
       if (book.cast[name].stages) for (const st of book.cast[name].stages) st.voice = v;
       saveBookSoon();
@@ -1590,121 +1621,51 @@ function renderCast() {
       if (book.cast[name].stages) for (const st of book.cast[name].stages) st.style = book.cast[name].style;
       saveBookSoon();
     });
+    const tagsInput = row.querySelector('.cast-tags-main');
+    if (tagsInput) {
+      tagsInput.addEventListener('input', (e) => {
+        book.cast[name] = book.cast[name] || { voice: '苏打', style: '' };
+        book.cast[name].tags = e.target.value.trim();
+        saveBookSoon();
+      });
+      tagsInput.addEventListener('change', () => clearUrlCache());
+    }
     row.querySelector('.cast-preview').addEventListener('click', async () => {
-      let voice = row.querySelector('.cast-voice').value;
-      let style = row.querySelector('.cast-style').value.trim();
       const who = name === '旁白' ? '旁白' : name;
-      const entry = book.cast[name];
+      const entry = book.cast[name] || {};
       const owner = name === '旁白' && book.firstPerson && book.protagonist && book.protagonist !== '我'
         ? book.protagonist
         : name;
       const pe = (book.cast || {})[owner] || entry;
-      let sample = '', desc = '', holder = pe;
+      const selVoice = row.querySelector('.cast-voice').value;
+      let voice = pe?.voice || selVoice;
+      let tags = '', card = '';
       if (pe?.stages && pe.stages.length > 1) {
         const st = pe.stages.find((s) => chapterIdx >= s.from) || pe.stages[0];
         voice = st.voice || voice;
-        style = st.style || style;
-        desc = st.desc || '';
-        holder = st;
-        if (stageHasSample(st)) sample = await getVoiceSample(book.id, owner, st.sampleRef);
-      } else if (pe?.voiceMode === 'design') {
-        desc = pe.voiceDesc || '';
-        sample = await getEntrySample(book.id, owner, pe);
+        tags = stageTags(st, pe);
+        card = speechCard(pe, st);
+      } else {
+        tags = entryTags(pe);
+        card = speechCard(pe, null);
       }
-      if (!sample && desc && pe?.voiceMode === 'design') {
-        sample = await ensureDesignSample(book.id, owner, who, holder, desc);
-      }
-      previewVoice(`你好，我是${who}。`, pe?.voice || voice, style, sample);
+      previewVoice(`你好，我是${who}。`, voice, tags, card);
     });
     row.querySelectorAll('.stage-row').forEach((sr) => {
       const si = +sr.dataset.si;
       const st = book.cast[name]?.stages?.[si];
       if (!st) return;
-      sr.querySelector('.stage-desc').addEventListener('input', (ev) => {
-        st.desc = ev.target.value.trim();
-        const ok = stageHasSample(st);
-        sr.querySelector('.stage-preview').hidden = !ok;
-        sr.querySelector('.stage-gen').textContent = ok ? '重新生成音色' : '生成音色';
+      const stTags = sr.querySelector('.stage-tags');
+      stTags.addEventListener('input', (ev) => {
+        st.tags = ev.target.value.trim();
         saveBookSoon();
       });
-      sr.querySelector('.stage-gen').addEventListener('click', async () => {
-        if (!st.desc) { toast('先写该阶段的音色描述'); return; }
-        if (!confirm(`为「${name}」的「${st.label || aiRangeLabel(st)}」生成自定义音色？\n会调用一次 mimo-v2.5-tts-voicedesign（目前限时免费）。`)) return;
-        const btn = sr.querySelector('.stage-gen');
-        btn.disabled = true;
-        btn.textContent = '生成中…';
-        try {
-          const uri = await designVoice(st.desc);
-          const ref = await descRef(st.desc);
-          await putVoiceSample(book.id, name, uri, st.desc, ref);
-          st.sampleRef = ref;
-          st.sampleDesc = st.desc;
-          st.sampleId = Date.now();
-          if (book.cast[name]) book.cast[name].voiceMode = 'design';
-          saveBookSoon();
-          renderCast();
-          toast('音色已生成，可点「试听」');
-        } catch (err) {
-          btn.disabled = false;
-          btn.textContent = '生成音色';
-          toast('生成失败：' + (err.message || err), 5000);
-        }
-      });
-      sr.querySelector('.stage-preview').addEventListener('click', async () => {
-        const uri = await getVoiceSample(book.id, name, st.sampleRef);
-        if (!uri) { toast('还没有生成音色'); return; }
-        if (previewAudio) previewAudio.pause();
-        previewAudio = new Audio(uri);
-        previewAudio.play().catch(() => toast('播放失败'));
+      stTags.addEventListener('change', () => clearUrlCache());
+      sr.querySelector('.stage-preview').addEventListener('click', () => {
+        const voice = st.voice || book.cast[name]?.voice || '苏打';
+        previewVoice(`你好，我是${name}。`, voice, stageTags(st, book.cast[name]), speechCard(book.cast[name], st));
       });
     });
-    const descInput = row.querySelector('.cast-vdesc');
-    if (descInput) {
-      descInput.addEventListener('input', (e) => {
-        book.cast[name].voiceDesc = e.target.value.trim();
-        saveBookSoon();
-      });
-    }
-    const genBtn = row.querySelector('.cast-gen');
-    if (genBtn) {
-      genBtn.addEventListener('click', async () => {
-        const desc = row.querySelector('.cast-vdesc').value.trim();
-        if (!desc) { toast('先写音色描述'); return; }
-        if (!confirm(`为「${name}」生成自定义音色？\n会调用一次 mimo-v2.5-tts-voicedesign（目前限时免费），之后每段用 voiceclone 复用这个音色。`)) return;
-        genBtn.disabled = true;
-        genBtn.textContent = '生成中…';
-        try {
-          const uri = await designVoice(desc);
-          const ref = await descRef(desc);
-          await putVoiceSample(book.id, name, uri, desc, ref);
-          book.cast[name].voiceMode = 'design';
-          book.cast[name].voiceDesc = desc;
-          book.cast[name].sampleRef = ref;
-          book.cast[name].sampleDesc = desc;
-          book.cast[name].sampleId = Date.now();
-          if (book.firstPerson && name === book.protagonist && book.cast['旁白']) {
-            book.cast['旁白'].voice = book.cast[name].voice;
-          }
-          saveBookSoon();
-          renderCast();
-          toast('音色已生成，可点「试听音色」');
-        } catch (err) {
-          genBtn.disabled = false;
-          genBtn.textContent = book.cast[name]?.sampleId ? '重新生成音色' : '生成音色';
-          toast('生成失败：' + (err.message || err), 5000);
-        }
-      });
-    }
-    const sampleBtn = row.querySelector('.cast-sample');
-    if (sampleBtn) {
-      sampleBtn.addEventListener('click', async () => {
-        const uri = await getEntrySample(book.id, name, book.cast[name]);
-        if (!uri) { toast('还没有生成音色'); return; }
-        if (previewAudio) previewAudio.pause();
-        previewAudio = new Audio(uri);
-        previewAudio.play().catch(() => toast('播放失败'));
-      });
-    }
     row.querySelector('.cast-name').addEventListener('change', (e) => {
       if (name === '旁白') return;
       const newName = e.target.value.trim();
@@ -1718,25 +1679,20 @@ function renderCast() {
         const next = cur === '?' ? 'F' : cur === 'F' ? 'M' : '?';
         book.cast[name] = book.cast[name] || { voice: '苏打', style: '' };
         book.cast[name].gender = next;
-        const isDesign = book.cast[name].voiceMode === 'design';
-        if (!isDesign) {
-          const pool = next === 'F' ? ['茉莉', '冰糖'] : next === 'M' ? ['苏打', '白桦'] : ['冰糖', '苏打'];
-          book.cast[name].voice = pool[0];
-          if (book.cast[name].stages) for (const st of book.cast[name].stages) st.voice = pool[0];
-        }
+        const pool = next === 'F' ? ['茉莉', '冰糖'] : next === 'M' ? ['苏打', '白桦'] : ['冰糖', '苏打'];
+        book.cast[name].voice = pool[0];
+        if (book.cast[name].stages) for (const st of book.cast[name].stages) st.voice = pool[0];
         saveBookSoon();
         renderCast();
-        toast(next === '?' ? '已标记为未知' : `已标记为${genderLabel(next)}，${isDesign ? '自定义音色保持不变' : '音色已按性别调整'}`);
+        toast(next === '?' ? '已标记为未知' : `已标记为${genderLabel(next)}，音色已按性别调整`);
       });
     }
   });
   $('btnReanalyze').addEventListener('click', reanalyzeBook);
   $('btnAiCast').addEventListener('click', aiAnalyzeBook);
-  $('btnMakeVoices').addEventListener('click', async () => {
-    const tasks = collectVoiceTasks();
-    if (!tasks.length) { toast('没有待生成的音色：可先在角色上选「声音设计」或在分期里填描述'); return; }
-    if (!confirm(`为 ${tasks.length} 个音色阶段各生成一次自定义音色？\n模型 mimo-v2.5-tts-voicedesign（目前限时免费），可能会花一些时间。`)) return;
-    await generateVoiceTasks(tasks);
+  $('btnMakeVoices').addEventListener('click', () => {
+    if (!confirm('按当前音色描述和语气重新生成所有风格标签？手动改过的标签会被覆盖。')) return;
+    retagAll();
   });
   $('btnAddCast').addEventListener('click', () => {
     const name = prompt('角色名（和对白里的名字一致）');
@@ -1880,10 +1836,10 @@ async function updateCacheInfo() {
   } catch {}
 }
 
-async function previewVoice(text, voice, style, sample) {
+async function previewVoice(text, voice, tags, card) {
   toast('合成中…', 6000);
   try {
-    const blob = await requestTTS(text, voice, style, undefined, sample);
+    const blob = await requestTTS(text, voice, tags, card);
     if (previewAudio) { previewAudio.pause(); }
     previewAudio = new Audio(URL.createObjectURL(blob));
     previewAudio.play();
@@ -1907,13 +1863,14 @@ const AI_SYS = `你是中文小说角色分析助手。阅读给出的原文片�
 - gender：F（女）、M（男）或 ?（无法判断），依据“她/他”、身份称谓、亲属关系判断
 - voice：从 冰糖(清亮女声)、茉莉(温柔女声)、苏打(清朗男声)、白桦(低沉男声) 中选一个最贴合的
 - stage：这个角色在本段所处的阶段，只能填 童年/少年/青年/中年/老年/不变 之一（同一角色处于同一时期必须用同一个词；没有明显变化就填“不变”）
-- voiceDesc：20-40字的音色描述，只写本段这个阶段的年龄、性别、音质、语速，用于生成自定义音色，例如“八岁男孩，声音清脆，语速偏快”；不要写台词
+- voiceDesc：20-40字的音色描述，只写本段这个阶段的年龄、性别、音质、语速，例如“八岁男孩，声音清脆，语速偏快”；不要写台词
+- tags：2-5个空格分隔的风格标签，只从这些词里选：磁性/醇厚/清亮/空灵/稚嫩/苍老/甜美/沙哑/醇雅/温柔/高冷/活泼/严肃/慵懒/俏皮/深沉/低沉/干练/凌厉/御姐音/正太音/大叔音/夹子音/台湾腔/东北话/四川话/河南话/粤语，可再加“语速较快/语速缓慢”；不要写台词和剧情
 - tone：不超过12个字的语气指令，概括这个角色本段说话的风格
-这是长篇小说的一个片段，人物可能随剧情长大或变老。同一人物在不同片段处于不同年龄/身份阶段时，stage 和 voiceDesc 要如实反映该阶段；处于同一阶段时请保持相同的阶段标签和尽量一致的描述，避免重复刷新。
+这是长篇小说的一个片段，人物可能随剧情长大或变老。同一人物在不同片段处于不同年龄/身份阶段时，stage、voiceDesc 和 tags 要如实反映该阶段；处于同一阶段时请保持相同的阶段标签、描述和标签组合，避免重复刷新。
 这里只提供全书的一批章节，请按这一批内容判断角色当时所处的阶段，不要推断更后面的剧情。
 同时判断：firstPerson（本段是否第一人称叙述）、protagonist（第一人称主角的名字；不是第一人称则填本段最主要角色的名字）。
 只输出 JSON，不要解释，格式：
-{"characters":[{"name":"","aliases":[],"gender":"F","voice":"茉莉","stage":"青年","voiceDesc":"","tone":""}],"firstPerson":true,"protagonist":""}`;
+{"characters":[{"name":"","aliases":[],"gender":"F","voice":"茉莉","stage":"青年","voiceDesc":"","tags":"","tone":""}],"firstPerson":true,"protagonist":""}`;
 let aiAbort = null;
 let aiPreview = null;
 let aiCancelled = false;
@@ -2154,6 +2111,7 @@ function aiBuildStages(chunkResults, canonOf) {
         to: cr.to,
         label: String(c.stage || '').trim().slice(0, 8),
         desc: String(c.voiceDesc || '').replace(/\s+/g, ' ').trim().slice(0, 60),
+        tags: cleanTagList(c.tags),
         tone: String(c.tone || '').trim().slice(0, 16),
         voice: AI_VOICES.includes(v) ? v : '',
       });
@@ -2166,17 +2124,18 @@ function aiBuildStages(chunkResults, canonOf) {
     for (const r of arr) {
       const prev = stages[stages.length - 1];
       if (!prev) {
-        stages.push({ from: r.from, to: r.to, label: r.label, desc: r.desc, tone: r.tone, voice: r.voice });
+        stages.push({ from: r.from, to: r.to, label: r.label, desc: r.desc, tags: r.tags, tone: r.tone, voice: r.voice });
         continue;
       }
       const sameLabel = sameStagePeriod(prev.label, r.label);
       const sameDesc = !!(r.desc && prev.desc && r.desc === prev.desc);
       if (r.desc && prev.desc && !sameDesc && !sameLabel) {
-        stages.push({ from: r.from, to: r.to, label: r.label, desc: r.desc, tone: r.tone, voice: r.voice });
+        stages.push({ from: r.from, to: r.to, label: r.label, desc: r.desc, tags: r.tags, tone: r.tone, voice: r.voice });
         continue;
       }
       prev.to = Math.max(prev.to, r.to);
       if (!prev.desc && r.desc) prev.desc = r.desc;
+      if (!prev.tags && r.tags) prev.tags = r.tags;
       if (!prev.label && r.label) prev.label = r.label;
       if (!prev.tone && r.tone) prev.tone = r.tone;
       if (!prev.voice && r.voice) prev.voice = r.voice;
@@ -2185,7 +2144,11 @@ function aiBuildStages(chunkResults, canonOf) {
     for (const s of stages) {
       if (!s.desc) continue;
       const prev = cleaned[cleaned.length - 1];
-      if (prev && prev.desc === s.desc) { prev.to = Math.max(prev.to, s.to); continue; }
+      if (prev && prev.desc === s.desc) {
+        prev.to = Math.max(prev.to, s.to);
+        if (!prev.tags && s.tags) prev.tags = s.tags;
+        continue;
+      }
       cleaned.push(s);
     }
     if (cleaned.length > 1) out.set(name, cleaned);
@@ -2241,6 +2204,7 @@ function aiShowPreview(rawResults, meta, errors, totalChunks) {
     if (!p.tone) p.tone = r.tone;
     if (!p.voice) p.voice = r.voice;
     if (!p.voiceDesc) p.voiceDesc = r.voiceDesc;
+    if (!p.tags) p.tags = r.tags;
     if ((r.stages || []).length > (p.stages || []).length) p.stages = r.stages;
   }
   const results = [...byName.values()];
@@ -2250,6 +2214,7 @@ function aiShowPreview(rawResults, meta, errors, totalChunks) {
     r.stages = (r.stages || []).filter((s) => s.desc);
     if (r.stages.length > 1) r.voiceDesc = r.stages[0].desc;
     r.voiceDesc = (r.voiceDesc || ((book.cast || {})[r.name] || {}).voiceDesc || '').slice(0, 60);
+    r.tags = cleanTagList(r.tags) || deriveTags(r.voiceDesc, r.tone).join(' ');
     r.isNew = !known.has(r.name) && !(book.cast || {})[r.name];
   }
   results.sort((a, b) => (a.isNew ? 1 : 0) - (b.isNew ? 1 : 0) || b.hits - a.hits);
@@ -2266,7 +2231,7 @@ function aiShowPreview(rawResults, meta, errors, totalChunks) {
         <div class="ai-name">${escapeAttr(r.name)}<span class="ai-badge${r.isNew ? ' new' : ''}">${r.isNew ? '新增' : '已有'}</span><span class="gchip g-${g}">${genderLabel(g)}</span></div>
         ${r.aliases.length ? `<div class="ai-alias">别名：${escapeAttr(r.aliases.join('、'))}</div>` : ''}
         ${stHtml}
-        <div class="ai-meta">音色 ${escapeAttr(r.voice)} · 语气 ${escapeAttr(r.tone)}${cur.style && cur.style !== r.tone ? ` · 当前语气 ${escapeAttr(cur.style)}` : ''}</div>
+        <div class="ai-meta">音色 ${escapeAttr(r.voice)} · 语气 ${escapeAttr(r.tone)}${r.tags ? ` · 标签 ${escapeAttr(r.tags)}` : ''}${cur.style && cur.style !== r.tone ? ` · 当前语气 ${escapeAttr(cur.style)}` : ''}</div>
       </div>
     </label>`;
   }).join('');
@@ -2305,29 +2270,23 @@ async function aiApplySelection() {
     const winFrom = meta.from ?? 0;
     const winTo = meta.to ?? winFrom;
     const incoming = (r.stages && r.stages.length > 1)
-      ? r.stages.map((s) => ({ from: s.from, to: s.to, label: s.label || '', desc: s.desc, style: s.tone || '', voice: s.voice || '' }))
-      : (r.voiceDesc ? [{ from: winFrom, to: winTo, label: '', desc: r.voiceDesc, style: r.tone || '', voice: r.voice || '' }] : []);
+      ? r.stages.map((s) => ({ from: s.from, to: s.to, label: s.label || '', desc: s.desc, tags: s.tags || '', style: s.tone || '', voice: s.voice || '' }))
+      : (r.voiceDesc ? [{ from: winFrom, to: winTo, label: '', desc: r.voiceDesc, tags: r.tags || '', style: r.tone || '', voice: r.voice || '' }] : []);
     const entry = Object.assign({}, book.cast[r.name] || {});
     if (r.gender !== '?') entry.gender = r.gender;
     else entry.gender = entry.gender || '?';
     const prevDesc = entry.voiceDesc || '';
     let merged = Array.isArray(entry.stages) ? entry.stages.map((s) => Object.assign({}, s)) : [];
     if (!merged.length && prevDesc && prevTo >= 0 && winFrom > 0) {
-      const prevStage = { from: 0, to: prevTo, label: '', desc: prevDesc, style: entry.style || '', voice: entry.voice || '' };
-      if (entry.sampleId) {
-        try {
-          const ref = await descRef(prevDesc);
-          let uri = await getVoiceSample(book.id, r.name, ref);
-          if (!uri) {
-            const base = await getVoiceSample(book.id, r.name);
-            if (base) { await putVoiceSample(book.id, r.name, base, prevDesc, ref); uri = base; }
-          }
-          if (uri) {
-            prevStage.sampleRef = ref;
-            prevStage.sampleDesc = prevDesc;
-          }
-        } catch {}
-      }
+      const prevStage = {
+        from: 0,
+        to: prevTo,
+        label: '',
+        desc: prevDesc,
+        tags: entry.tags || deriveTags(prevDesc, entry.style).join(' '),
+        style: entry.style || '',
+        voice: entry.voice || '',
+      };
       merged.push(prevStage);
     }
     for (const s of incoming) {
@@ -2337,9 +2296,9 @@ async function aiApplySelection() {
         const sameLabel = sameStagePeriod(last.label, s.label);
         if (last.desc === s.desc || sameLabel) {
           last.to = Math.max(last.to, s.to);
-          if (!last.sampleRef && !last.sampleDesc && s.desc !== last.desc) last.desc = s.desc;
           if (!last.label && s.label) last.label = s.label;
           if (!last.style && s.style) last.style = s.style;
+          if (!last.tags && s.tags) last.tags = s.tags;
           if (!last.voice && s.voice) last.voice = s.voice;
           continue;
         }
@@ -2351,7 +2310,11 @@ async function aiApplySelection() {
     for (const s of merged) {
       if (!s.desc) continue;
       const prev = dedup[dedup.length - 1];
-      if (prev && prev.desc === s.desc) { prev.to = Math.max(prev.to, s.to); continue; }
+      if (prev && prev.desc === s.desc) {
+        prev.to = Math.max(prev.to, s.to);
+        if (!prev.tags && s.tags) prev.tags = s.tags;
+        continue;
+      }
       if (prev && prev.to >= s.from) s.from = prev.to + 1;
       if (s.from <= s.to) dedup.push(s);
     }
@@ -2360,22 +2323,18 @@ async function aiApplySelection() {
       entry.voice = dedup[0].voice || entry.voice || r.voice;
       entry.style = dedup[0].style || entry.style || r.tone;
       entry.voiceDesc = dedup[0].desc;
+      entry.tags = dedup[0].tags || deriveTags(dedup[0].desc, dedup[0].style || entry.style, dedup[0].label).join(' ');
       delete entry.sampleId;
       delete entry.sampleRef;
       delete entry.sampleDesc;
     } else {
       delete entry.stages;
-      const single = dedup[0];
       if (r.voiceDesc) entry.voiceDesc = r.voiceDesc;
       entry.voice = r.voice || entry.voice;
       entry.style = r.tone || entry.style;
-      if (single?.sampleRef && single.sampleDesc === single.desc) {
-        entry.sampleRef = single.sampleRef;
-        entry.sampleDesc = single.sampleDesc;
-        entry.sampleId = entry.sampleId || single.sampleId || Date.now();
-      }
+      entry.tags = cleanTagList(r.tags) || deriveTags(entry.voiceDesc, entry.style).join(' ');
     }
-    entry.voiceMode = 'design';
+    entry.voiceMode = 'tag';
     book.cast[r.name] = entry;
     for (const a of r.aliases) if (book.cast[a]) book.aliases[a] = r.name;
   }
@@ -2418,21 +2377,6 @@ async function aiApplySelection() {
   updatePlayerBar();
   aiNudgeCheck();
   toast(`已应用 ${picked.length} 个角色`);
-  const tasks = [];
-  for (const r of picked) {
-    const e = book.cast[r.name];
-    if (!e) continue;
-    if (e.stages && e.stages.length > 1) {
-      for (const st of e.stages) if (st.desc && !stageHasSample(st)) tasks.push({ name: r.name, desc: st.desc, stage: st });
-    } else if (r.voiceDesc && !(e.sampleId && e.voiceDesc === r.voiceDesc)) {
-      tasks.push({ name: r.name, desc: r.voiceDesc, stage: null });
-    }
-  }
-  if (tasks.length && confirm(`已写入 ${picked.length} 个角色，共 ${tasks.length} 个音色阶段还没有自定义音色。\n现在用声音设计逐个生成？每段 1 次请求（目前限时免费）。也可以之后在角色页分批生成。`)) {
-    for (const t of tasks) if (book.cast[t.name]) book.cast[t.name].voiceMode = 'design';
-    saveBookSoon();
-    await generateVoiceTasks(tasks);
-  }
 }
 
 function aiNudgeCheck() {
@@ -2599,7 +2543,7 @@ function bind() {
     saveSettings({ apiKey: $('apiKey').value.trim(), baseUrl: $('baseUrl').value.trim() || DEFAULT_BASE });
     $('btnTest').textContent = '合成中…';
     try {
-      const blob = await requestTTS('你好，这是语音合成测试。', '冰糖', '');
+      const blob = await requestTTS('你好，这是语音合成测试。', '冰糖', '', '');
       if (previewAudio) previewAudio.pause();
       previewAudio = new Audio(URL.createObjectURL(blob));
       await previewAudio.play();
