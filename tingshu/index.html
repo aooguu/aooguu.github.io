@@ -221,8 +221,11 @@
   </div>
 </div>
 
-<button id="playerBall" class="player-ball" hidden aria-label="AI 阅读" title="AI 阅读">
-  <span id="pbRing" class="pb-ring"></span>
+<button id="playerBall" class="player-ball" data-side="right" hidden aria-label="AI 阅读" title="AI 阅读">
+  <svg class="pb-ring" viewBox="0 0 32 36" aria-hidden="true">
+    <path class="pb-track" d="M16 2A14 16 0 0 0 16 34"/>
+    <path id="pbFill" class="pb-fill" d="M16 2A14 16 0 0 0 16 34"/>
+  </svg>
   <span class="pb-note">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
       <path d="M9.2 17.6V6.6l8.6-1.9v10.8"/>

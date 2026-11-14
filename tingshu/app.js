@@ -3,7 +3,7 @@
 const DEFAULT_BASE = 'https://api.xiaomimimo.com/v1';
 const AI_DEFAULT_BASE = 'https://api.deepseek.com/v1';
 const AI_DEFAULT_MODEL = 'deepseek-chat';
-const APP_VER = 'v27';
+const APP_VER = 'v28';
 const VOICES = [
   { id: '冰糖', label: '冰糖 · 中文女声' },
   { id: '茉莉', label: '茉莉 · 中文女声' },
@@ -2226,12 +2226,13 @@ function placePlayerPanel() {
   const br = ball.getBoundingClientRect();
   const pw = panel.offsetWidth;
   const ph = panel.offsetHeight;
-  let left = br.left + br.width / 2 - pw / 2;
+  const side = ball.dataset.side === 'left' ? 'left' : 'right';
+  let left = side === 'right' ? br.left - pw - 12 : br.right + 12;
   left = Math.max(8, Math.min(left, window.innerWidth - pw - 8));
-  let top = br.top - ph - 10;
-  if (top < 8) top = Math.min(window.innerHeight - ph - 8, br.bottom + 10);
+  let top = br.top + br.height / 2 - ph / 2;
+  top = Math.max(8, Math.min(top, window.innerHeight - ph - 8));
   panel.style.left = left + 'px';
-  panel.style.top = Math.max(8, top) + 'px';
+  panel.style.top = top + 'px';
 }
 
 function setPlayerPanel(open) {
@@ -2260,9 +2261,9 @@ function updatePlayerBar() {
   ball.title = seg
     ? `${book.title} · ${ch.title} · ${seg.speaker} ${currentSeg + 1}/${chapterSegments.length}`
     : `${book.title} · ${ch.title} · ${chapterSegments.length} 段`;
-  const pct = chapterSegments.length ? Math.round(((currentSeg + 1) / chapterSegments.length) * 100) : 0;
-  const ring = $('pbRing');
-  if (ring) ring.style.background = `conic-gradient(rgba(61,220,132,.95) ${pct}%, rgba(61,220,132,.16) 0)`;
+  const pct = chapterSegments.length ? Math.min(1, (currentSeg + 1) / chapterSegments.length) : 0;
+  const fill = $('pbFill');
+  if (fill) fill.style.strokeDashoffset = String(47.2 * (1 - pct));
   const ppTitle = $('ppTitle');
   if (ppTitle) ppTitle.textContent = `${book.title} · ${ch.title}`;
   if (playerPanelOpen) placePlayerPanel();
@@ -3482,25 +3483,19 @@ function bind() {
   const ball = $('playerBall');
   let ballDrag = null;
   let ballSuppressClick = false;
-  const BALL_SIZE = 44;
-  const placeBall = (x, y) => {
-    const px = Math.min(Math.max(6, x), window.innerWidth - BALL_SIZE - 6);
-    const py = Math.min(Math.max(6, y), window.innerHeight - BALL_SIZE - 6);
-    ball.style.left = px + 'px';
-    ball.style.top = py + 'px';
-    ball.style.right = 'auto';
-    ball.style.bottom = 'auto';
-    return { x: px, y: py };
-  };
-  const saveBallPos = (x, y) => {
-    try { localStorage.setItem('tts.ballPos', JSON.stringify({ x, y })); } catch {}
+  const BALL_W = 32;
+  const BALL_H = 36;
+  const clampBallY = (y) => Math.min(Math.max(8, y), window.innerHeight - BALL_H - 8);
+  const setBallTop = (y) => { ball.style.top = clampBallY(y) + 'px'; };
+  const saveBallPos = () => {
+    try { localStorage.setItem('tts.ballPos', JSON.stringify({ side: ball.dataset.side, y: parseFloat(ball.style.top) || 0 })); } catch {}
   };
   try {
     const saved = JSON.parse(localStorage.getItem('tts.ballPos') || 'null');
-    if (saved && Number.isFinite(saved.x) && Number.isFinite(saved.y)) {
-      placeBall(saved.x, saved.y);
-    }
+    if (saved && saved.side === 'left') ball.dataset.side = 'left';
+    if (saved && Number.isFinite(saved.y)) setBallTop(saved.y);
   } catch {}
+  if (!ball.style.top) setBallTop(window.innerHeight * 0.55);
   ball.addEventListener('pointerdown', (e) => {
     if (e.button != null && e.button !== 0) return;
     const r = ball.getBoundingClientRect();
@@ -3511,21 +3506,23 @@ function bind() {
     if (!ballDrag || e.pointerId !== ballDrag.id) return;
     const nx = e.clientX - ballDrag.ox;
     const ny = e.clientY - ballDrag.oy;
-    if (!ballDrag.moved && Math.hypot(nx - ballDrag.x, ny - ballDrag.y) > 4) ballDrag.moved = true;
-    if (ballDrag.moved) {
-      const p = placeBall(nx, ny);
-      ballDrag.x = p.x;
-      ballDrag.y = p.y;
-      if (playerPanelOpen) placePlayerPanel();
+    if (!ballDrag.moved && Math.hypot(nx - ballDrag.x, ny - ballDrag.y) > 4) {
+      ballDrag.moved = true;
+      ball.classList.add('dragging');
     }
+    if (!ballDrag.moved) return;
+    const side = nx + BALL_W / 2 < window.innerWidth / 2 ? 'left' : 'right';
+    if (ball.dataset.side !== side) ball.dataset.side = side;
+    setBallTop(ny);
+    if (playerPanelOpen) placePlayerPanel();
   });
   const endBallDrag = (e) => {
     if (!ballDrag || e.pointerId !== ballDrag.id) return;
     const moved = ballDrag.moved;
     ballDrag = null;
+    ball.classList.remove('dragging');
     if (moved) {
-      const r = ball.getBoundingClientRect();
-      saveBallPos(r.left, r.top);
+      saveBallPos();
       if (playerPanelOpen) placePlayerPanel();
       ballSuppressClick = true;
       setTimeout(() => { ballSuppressClick = false; }, 350);
@@ -3542,10 +3539,9 @@ function bind() {
   $('ppPlay').addEventListener('click', togglePlay);
   $('ppNext').addEventListener('click', () => playIndex(currentSeg + 1));
   window.addEventListener('resize', () => {
-    if (ball.style.left) {
-      const r = ball.getBoundingClientRect();
-      const p = placeBall(r.left, r.top);
-      saveBallPos(p.x, p.y);
+    if (ball.style.top) {
+      setBallTop(parseFloat(ball.style.top) || 0);
+      saveBallPos();
     }
     if (playerPanelOpen) placePlayerPanel();
   });
@@ -3701,7 +3697,7 @@ let chatHoldStartY = 0;
 let chatHoldCancel = false;
 let chatQuote = null;
 let msgMenuMsg = null;
-const CHAT_VOICE_SVG = '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4.6 9.4h2.7l3.4-3.1v11.4l-3.4-3.1H4.6z" fill="currentColor"/><path class="cv-w1" d="M13.4 9a4.6 4.6 0 010 6" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><path class="cv-w2" d="M16.6 6.6a8.2 8.2 0 010 10.8" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg>';
+const CHAT_VOICE_SVG = '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path class="cv-w1" d="M5.8 10.3a3.4 3.4 0 010 3.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path class="cv-w2" d="M9.9 8.2a6.8 6.8 0 010 7.6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path class="cv-w3" d="M14 6.1a10.2 10.2 0 010 11.8" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>';
 
 function chatSaveSoon() {
   if (!chat) return;
